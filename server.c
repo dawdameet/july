@@ -11,12 +11,52 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-#define MAX_QUEUE 64
+#define MAX_QUEUE 1024
 #define NUM_WORKERS 4
 
 // Add these two prototypes above worker_thread()
 int execute_task(const Task *task, char *out_buf, size_t out_buf_size);
 void free_task(Task *task);
+
+ssize_t read_full_http_request(int fd, char *buf, size_t max_len)
+{
+    size_t total = 0;
+    char *header_end = NULL;
+    size_t expected_total = 0;
+
+    while (total < max_len - 1)
+    {
+        ssize_t n = read(fd, buf + total, max_len - 1 - total);
+        if (n <= 0)
+            break;
+        total += (size_t)n;
+        buf[total] = '\0';
+
+        // Once headers arrive, calculate the exact total byte count we need
+        if (!header_end)
+        {
+            header_end = strstr(buf, "\r\n\r\n");
+            if (header_end)
+            {
+                size_t header_bytes = (size_t)((header_end + 4) - buf);
+                size_t content_len = 0;
+                char *cl = strstr(buf, "Content-Length:");
+                if (cl && cl < header_end)
+                {
+                    content_len = (size_t)strtoull(cl + 15, NULL, 10);
+                }
+                expected_total = header_bytes + content_len;
+            }
+        }
+
+        // Stop reading as soon as headers + full body have arrived
+        if (header_end && total >= expected_total)
+        {
+            break;
+        }
+    }
+    return (ssize_t)total;
+}
 
 typedef struct
 {
@@ -248,7 +288,7 @@ int main(void)
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-    if (listen(server_fd, 16) < 0)
+    if (listen(server_fd, 1024) < 0)
     {
         perror("listen failed");
         close(server_fd);
@@ -266,7 +306,8 @@ int main(void)
         }
 
         memset(buffer, 0, BUFFER_SIZE);
-        ssize_t bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1);
+        ssize_t bytes_read = read_full_http_request(client_fd, buffer, BUFFER_SIZE);
+
         if (bytes_read <= 0)
         {
             close(client_fd);
