@@ -7,13 +7,13 @@ with open("fast_payload.bin", "wb") as f:
 
 # 2. Run autocannon via subprocess.run
 cmd = [
-    "npx",
-    "autocannon",
+    "npx", "autocannon",
     "-4",
     "-c", "50",
     "-d", "10",
     "-m", "POST",
     "-H", "Content-Type=application/octet-stream",
+    "--renderStatusCodes",
     "-i", "fast_payload.bin",
     "http://localhost:8080/task",
 ]
