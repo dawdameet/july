@@ -8,6 +8,75 @@
 #define PORT 8080
 #define BUFFER_SIZE 1024
 
+#include <pthread.h>
+#include <stdbool.h>
+
+#define MAX_QUEUE 64
+#define NUM_WORKERS 4
+
+// Add these two prototypes above worker_thread()
+int execute_task(const Task *task, char *out_buf, size_t out_buf_size);
+void free_task(Task *task);
+
+typedef struct
+{
+    Task tasks[MAX_QUEUE];
+    int head, tail, count;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} TaskQueue;
+
+TaskQueue queue = {.lock = PTHREAD_MUTEX_INITIALIZER,
+                   .not_empty = PTHREAD_COND_INITIALIZER,
+                   .not_full = PTHREAD_COND_INITIALIZER};
+
+// Called by HTTP main thread (returns 0 on success, -1 if queue is full)
+int enqueue_task(Task task)
+{
+    pthread_mutex_lock(&queue.lock);
+    if (queue.count == MAX_QUEUE)
+    {
+        pthread_mutex_unlock(&queue.lock);
+        return -1; // Server busy (return 503 Service Unavailable)
+    }
+    queue.tasks[queue.tail] = task; // Transfers ownership of malloc'd pointers
+    queue.tail = (queue.tail + 1) % MAX_QUEUE;
+    queue.count++;
+    pthread_cond_signal(&queue.not_empty);
+    pthread_mutex_unlock(&queue.lock);
+    return 0;
+}
+
+// Background worker thread loop
+void *worker_thread(void *arg)
+{
+    (void)arg;
+    while (1)
+    {
+        pthread_mutex_lock(&queue.lock);
+        while (queue.count == 0)
+        {
+            pthread_cond_wait(&queue.not_empty, &queue.lock);
+        }
+        Task task = queue.tasks[queue.head];
+        queue.head = (queue.head + 1) % MAX_QUEUE;
+        queue.count--;
+        pthread_cond_signal(&queue.not_full);
+        pthread_mutex_unlock(&queue.lock);
+
+        // Execute outside the lock so multiple commands run in parallel
+        char output[4096] = {0};
+        int status = execute_task(&task, output, sizeof(output));
+        printf("[Worker %lu] Task %s finished (exit=%d)\n",
+               (unsigned long)pthread_self(), task.taskId, status);
+
+        // TODO: Save output/status to a thread-safe result table
+        free_task(&task);
+    }
+    return NULL;
+}
+
 int execute_task(const Task *task, char *out_buf, size_t out_buf_size)
 {
     printf("[Worker] Executing Task %s: %s\n", task->taskId, task->taskCommand);
@@ -125,10 +194,39 @@ int main(void)
         "\r\n"
         "Hello, World!";
 
+    const char *response_202 =
+        "HTTP/1.1 202 Accepted\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 11\r\n"
+        "\r\n"
+        "Task Queued";
+
+    const char *response_400 =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+
     const char *response_404 =
         "HTTP/1.1 404 Not Found\r\n"
         "Content-Length: 0\r\n"
         "\r\n";
+
+    const char *response_503 =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+
+    // 1. Spawn the worker thread pool
+    pthread_t workers[NUM_WORKERS];
+    for (int i = 0; i < NUM_WORKERS; i++)
+    {
+        if (pthread_create(&workers[i], NULL, worker_thread, NULL) != 0)
+        {
+            perror("pthread_create failed");
+            exit(EXIT_FAILURE);
+        }
+        pthread_detach(workers[i]);
+    }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
@@ -150,14 +248,14 @@ int main(void)
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-    if (listen(server_fd, 5) < 0)
+    if (listen(server_fd, 16) < 0)
     {
         perror("listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Server running on http://localhost:%d\n", PORT);
+    printf("Server running on http://localhost:%d with %d workers\n", PORT, NUM_WORKERS);
     while (1)
     {
         client_fd = accept(server_fd, (struct sockaddr *)&address, &addr_len);
@@ -188,36 +286,30 @@ int main(void)
             {
                 size_t received_body_len = (size_t)((buffer + bytes_read) - body);
                 Task task = {0};
+
                 if (received_body_len >= declared_len &&
                     parse_task(body, declared_len, &task) == 0)
                 {
-                    char cmd_output[4096] = {0};
-                    int exit_status = execute_task(&task, cmd_output, sizeof(cmd_output));
-
-                    if (exit_status == 0)
+                    if (enqueue_task(task) == 0)
                     {
-                        char response[4608];
-                        int resp_len = snprintf(response, sizeof(response),
-                                                "HTTP/1.1 200 OK\r\n"
-                                                "Content-Type: text/plain\r\n"
-                                                "Content-Length: %zu\r\n"
-                                                "\r\n"
-                                                "%s",
-                                                strlen(cmd_output), cmd_output);
-
-                        write(client_fd, response, resp_len);
+                        // Worker thread now owns `task` and will call free_task()
+                        write(client_fd, response_202, strlen(response_202));
                     }
                     else
                     {
-                        const char *response_500 =
-                            "HTTP/1.1 500 Internal Server Error\r\n"
-                            "Content-Length: 0\r\n"
-                            "\r\n";
-                        write(client_fd, response_500, strlen(response_500));
+                        // Queue is full; main thread still owns `task`
+                        free_task(&task);
+                        write(client_fd, response_503, strlen(response_503));
                     }
-
-                    free_task(&task);
                 }
+                else
+                {
+                    write(client_fd, response_400, strlen(response_400));
+                }
+            }
+            else
+            {
+                write(client_fd, response_400, strlen(response_400));
             }
         }
         else
