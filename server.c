@@ -8,6 +8,33 @@
 #define PORT 8080
 #define BUFFER_SIZE 1024
 
+int execute_task(const Task *task, char *out_buf, size_t out_buf_size)
+{
+    printf("[Worker] Executing Task %s: %s\n", task->taskId, task->taskCommand);
+
+    // "r" opens a pipe to read the command's standard output
+    FILE *pipe = popen(task->taskCommand, "r");
+    if (!pipe)
+    {
+        return -1;
+    }
+
+    size_t total_read = 0;
+    while (total_read < out_buf_size - 1)
+    {
+        size_t n = fread(out_buf + total_read, 1, out_buf_size - 1 - total_read, pipe);
+        if (n == 0)
+        {
+            break;
+        }
+        total_read += n;
+    }
+    out_buf[total_read] = '\0';
+
+    int status = pclose(pipe);
+    return status; // 0 typically means command succeeded
+}
+
 int extract_body(char *buffer, char **body, size_t *body_len)
 {
     // we take the raw buffer
@@ -76,6 +103,14 @@ int parse_task(const char *body, size_t body_len, Task *task)
     return 0;
 }
 
+void free_task(Task *task)
+{
+    free(task->taskId);
+    free(task->taskCommand);
+    task->taskId = NULL;
+    task->taskCommand = NULL;
+}
+
 int main(void)
 {
     int server_fd, client_fd;
@@ -133,10 +168,57 @@ int main(void)
         }
 
         memset(buffer, 0, BUFFER_SIZE);
-        read(client_fd, buffer, BUFFER_SIZE - 1);
+        ssize_t bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1);
+        if (bytes_read <= 0)
+        {
+            close(client_fd);
+            continue;
+        }
+
         if (strncmp(buffer, "GET / ", 6) == 0)
         {
             write(client_fd, response_200, strlen(response_200));
+        }
+        else if (strncmp(buffer, "POST /task ", 11) == 0)
+        {
+            char *body = NULL;
+            size_t declared_len = 0;
+
+            if (extract_body(buffer, &body, &declared_len) == 0)
+            {
+                size_t received_body_len = (size_t)((buffer + bytes_read) - body);
+                Task task = {0};
+                if (received_body_len >= declared_len &&
+                    parse_task(body, declared_len, &task) == 0)
+                {
+                    char cmd_output[4096] = {0};
+                    int exit_status = execute_task(&task, cmd_output, sizeof(cmd_output));
+
+                    if (exit_status == 0)
+                    {
+                        char response[4608];
+                        int resp_len = snprintf(response, sizeof(response),
+                                                "HTTP/1.1 200 OK\r\n"
+                                                "Content-Type: text/plain\r\n"
+                                                "Content-Length: %zu\r\n"
+                                                "\r\n"
+                                                "%s",
+                                                strlen(cmd_output), cmd_output);
+
+                        write(client_fd, response, resp_len);
+                    }
+                    else
+                    {
+                        const char *response_500 =
+                            "HTTP/1.1 500 Internal Server Error\r\n"
+                            "Content-Length: 0\r\n"
+                            "\r\n";
+                        write(client_fd, response_500, strlen(response_500));
+                    }
+
+                    free_task(&task);
+                }
+            }
         }
         else
         {
