@@ -16,6 +16,8 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <spawn.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 
 #if defined(__APPLE__)
 #include <sys/event.h>
@@ -825,11 +827,67 @@ static void handle_sig(int sig)
     g_running = 0;
 }
 
-int main(void)
+static void print_server_network_banner(int port, const char *backend)
+{
+    printf("\n┌─────────────────────────────────────────────────────────────┐\n");
+    printf("│  July Task Execution Server (%-6s backend)               │\n", backend);
+    printf("│  Listening on: 0.0.0.0:%-5d (All LAN interfaces)          │\n", port);
+    printf("│  Worker Pool:  %d threads                                   │\n", NUM_WORKERS);
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│  Connect with dispatcher from your Mac / LAN:               │\n");
+
+    struct ifaddrs *ifaddr, *ifa;
+    int found_lan = 0;
+    if (getifaddrs(&ifaddr) == 0)
+    {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+        {
+            if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(sa->sin_addr), ip_str, sizeof(ip_str));
+
+            if (strcmp(ip_str, "127.0.0.1") == 0)
+            {
+                printf("│    • Local loopback:  http://%s:%-5d                  │\n", ip_str, port);
+            }
+            else
+            {
+                printf("│    • LAN (%-8s): http://%-15s:%-5d          │\n", ifa->ifa_name, ip_str, port);
+                found_lan = 1;
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+    if (!found_lan)
+    {
+        printf("│    • No external LAN IP detected                            │\n");
+    }
+    printf("└─────────────────────────────────────────────────────────────┘\n\n");
+}
+
+int main(int argc, char **argv)
 {
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
     signal(SIGPIPE, SIG_IGN);
+
+    int port = PORT;
+    if (argc > 1)
+    {
+        int p = atoi(argv[1]);
+        if (p > 0 && p <= 65535)
+            port = p;
+    }
+    const char *env_port = getenv("PORT");
+    if (env_port)
+    {
+        int p = atoi(env_port);
+        if (p > 0 && p <= 65535)
+            port = p;
+    }
 
     pthread_mutex_init(&queue.lock, NULL);
     pthread_cond_init(&queue.not_empty, NULL);
@@ -847,7 +905,7 @@ int main(void)
 
     struct sockaddr_in address = {0};
     address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(PORT);
+    address.sin_port = htons(port);
     address.sin_family = AF_INET;
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
@@ -901,8 +959,7 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    printf("July optimized server (kqueue) on http://localhost:%d with %d workers\n",
-           PORT, NUM_WORKERS);
+    print_server_network_banner(port, "kqueue");
 
     struct kevent events[256];
     while (g_running)
@@ -1102,8 +1159,7 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    printf("July optimized server (epoll) on http://localhost:%d with %d workers\n",
-           PORT, NUM_WORKERS);
+    print_server_network_banner(port, "epoll");
 
     struct epoll_event events[256];
     while (g_running)
