@@ -10,3 +10,4 @@ clean:
 	rm -f matrix_simd matrix_result.bin matrix_report.json
 
 .PHONY: all clean
+

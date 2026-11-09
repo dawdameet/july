@@ -10,3 +10,4 @@ clean:
 	rm -f tick_gen ticks.bin analytics_summary.json
 
 .PHONY: all clean
+
