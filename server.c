@@ -23,6 +23,7 @@
 #include <spawn.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 #if defined(__APPLE__)
 #include <sys/event.h>
@@ -489,7 +490,16 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
             break;
         }
 
-        usleep(10000); // 10ms sleep
+        // Sub-millisecond reactive wakeup via poll() instead of 10ms idle sleep
+        struct pollfd pfd = {.fd = pipefd[0], .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
+        int poll_timeout = 5; // max 5ms fallback check
+        if (timeout_sec > 0)
+        {
+            int rem_ms = (int)((timeout_sec - elapsed) * 1000.0);
+            if (rem_ms <= 0) poll_timeout = 0;
+            else if (rem_ms < poll_timeout) poll_timeout = rem_ms;
+        }
+        poll(&pfd, 1, poll_timeout);
     }
 
     // Final drain of any remaining pipe output
@@ -1331,15 +1341,22 @@ static int prepare_response(Connection *conn, size_t request_len)
                 {
                     struct stat st;
                     fstat(art_fd, &st);
+                    bool want_close = request_wants_close(conn->input, conn->header_bytes);
                     char hdr[512];
                     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: application/octet-stream\r\n"
                         "Content-Length: %zu\r\n"
                         "Content-Disposition: attachment; filename=\"%s\"\r\n"
-                        "Connection: close\r\n"
+                        "Connection: %s\r\n"
                         "\r\n",
-                        (size_t)st.st_size, filename);
+                        (size_t)st.st_size, filename,
+                        want_close ? "close" : "keep-alive");
+
+#if defined(__linux__)
+                    int cork = 1;
+                    setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
 
 #if defined(MSG_NOSIGNAL)
                     send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
@@ -1348,7 +1365,12 @@ static int prepare_response(Connection *conn, size_t request_len)
 #endif
                     send_file_zero_copy(conn->fd, art_fd, (size_t)st.st_size);
                     close(art_fd);
-                    conn->close_after_write = true;
+
+#if defined(__linux__)
+                    cork = 0;
+                    setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+                    conn->close_after_write = want_close;
                     conn->output_len = 0;
                     conn->output_offset = 0;
                     return 1; // Streamed directly
@@ -1397,6 +1419,7 @@ static int prepare_response(Connection *conn, size_t request_len)
                     {
                         struct stat log_st;
                         fstat(log_fd, &log_st);
+                        bool want_close = request_wants_close(conn->input, conn->header_bytes);
                         char hdr[512];
                         int hlen = snprintf(hdr, sizeof(hdr),
                             "HTTP/1.1 200 OK\r\n"
@@ -1405,9 +1428,15 @@ static int prepare_response(Connection *conn, size_t request_len)
                             "X-Task-Exit-Code: %d\r\n"
                             "X-Artifacts-Count: %d\r\n"
                             "Content-Length: %zu\r\n"
-                            "Connection: close\r\n"
+                            "Connection: %s\r\n"
                             "\r\n",
-                            exit_code, art_count, (size_t)log_st.st_size);
+                            exit_code, art_count, (size_t)log_st.st_size,
+                            want_close ? "close" : "keep-alive");
+
+#if defined(__linux__)
+                        int cork = 1;
+                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
 
 #if defined(MSG_NOSIGNAL)
                         send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
@@ -1416,7 +1445,12 @@ static int prepare_response(Connection *conn, size_t request_len)
 #endif
                         send_file_zero_copy(conn->fd, log_fd, (size_t)log_st.st_size);
                         close(log_fd);
-                        conn->close_after_write = true;
+
+#if defined(__linux__)
+                        cork = 0;
+                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+                        conn->close_after_write = want_close;
                         conn->output_len = 0;
                         conn->output_offset = 0;
                         return 1;

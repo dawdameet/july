@@ -13,8 +13,10 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/uio.h>
 
 #include "task.h"
 #include "workflow.h"
@@ -116,6 +118,9 @@ static int connect_to_server(const char *host, int port)
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
         if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
             break;
 
@@ -182,20 +187,39 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
         return -1;
     }
 
-    if (write(sock, headers, header_len) != header_len)
-    {
-        perror("write headers");
-        close(sock);
-        free(payload);
-        return -1;
-    }
+    // Vectored I/O: send headers and binary payload in single atomic syscall
+    struct iovec iov[2];
+    iov[0].iov_base = headers;
+    iov[0].iov_len = (size_t)header_len;
+    iov[1].iov_base = payload;
+    iov[1].iov_len = payload_len;
 
-    if ((size_t)write(sock, payload, payload_len) != payload_len)
+    size_t total_to_write = (size_t)header_len + payload_len;
+    size_t total_written = 0;
+    while (total_written < total_to_write)
     {
-        perror("write payload");
-        close(sock);
-        free(payload);
-        return -1;
+        ssize_t w = writev(sock, iov, 2);
+        if (w <= 0)
+        {
+            if (w < 0 && (errno == EINTR || errno == EAGAIN))
+                continue;
+            close(sock);
+            free(payload);
+            return -1;
+        }
+        total_written += (size_t)w;
+        if ((size_t)w >= iov[0].iov_len)
+        {
+            size_t rem = (size_t)w - iov[0].iov_len;
+            iov[0].iov_len = 0;
+            iov[1].iov_base = (char *)iov[1].iov_base + rem;
+            iov[1].iov_len -= rem;
+        }
+        else
+        {
+            iov[0].iov_base = (char *)iov[0].iov_base + w;
+            iov[0].iov_len -= (size_t)w;
+        }
     }
     free(payload);
 
@@ -230,13 +254,23 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
     return 0;
 }
 
-/* Retrieve task status and output from GET /retrieve/<taskId> */
-static int retrieve_task(const char *host, int port, const char *task_id,
-                         int *exit_code, int *artifacts_count, char **output_body, size_t *output_len)
+/* Retrieve task status and output with persistent connection reuse */
+static int retrieve_task_conn(int *sock_ptr, const char *host, int port, const char *task_id,
+                              int *exit_code, int *artifacts_count, char **output_body, size_t *output_len)
 {
-    int sock = connect_to_server(host, port);
-    if (sock < 0)
-        return -1;
+    int sock = -1;
+    if (sock_ptr && *sock_ptr >= 0)
+    {
+        sock = *sock_ptr;
+    }
+    else
+    {
+        sock = connect_to_server(host, port);
+        if (sock < 0)
+            return -1;
+        if (sock_ptr)
+            *sock_ptr = sock;
+    }
 
     char auth_hdr[300] = {0};
     append_auth_header(auth_hdr, sizeof(auth_hdr));
@@ -246,14 +280,24 @@ static int retrieve_task(const char *host, int port, const char *task_id,
         "GET /retrieve/%s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "%s"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n",
         task_id, host, port, auth_hdr);
 
     if (write(sock, request, req_len) != req_len)
     {
         close(sock);
-        return -1;
+        if (sock_ptr) *sock_ptr = -1;
+        // Reconnect once on broken persistent socket
+        sock = connect_to_server(host, port);
+        if (sock < 0) return -1;
+        if (sock_ptr) *sock_ptr = sock;
+        if (write(sock, request, req_len) != req_len)
+        {
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+            return -1;
+        }
     }
 
     size_t capacity = RESPONSE_BUF_SIZE;
@@ -262,10 +306,12 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     if (!buf)
     {
         close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
-    while (1)
+    char *header_end = NULL;
+    while (!header_end)
     {
         if (total_read >= capacity - 1)
         {
@@ -275,6 +321,7 @@ static int retrieve_task(const char *host, int port, const char *task_id,
             {
                 free(buf);
                 close(sock);
+                if (sock_ptr) *sock_ptr = -1;
                 return -1;
             }
             buf = new_buf;
@@ -284,21 +331,42 @@ static int retrieve_task(const char *host, int port, const char *task_id,
         if (n <= 0)
             break;
         total_read += (size_t)n;
+        buf[total_read] = '\0';
+        header_end = strstr(buf, "\r\n\r\n");
     }
-    close(sock);
 
-    buf[total_read] = '\0';
+    if (!header_end)
+    {
+        free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -1;
+    }
 
     int status_code = 0;
     if (sscanf(buf, "HTTP/1.1 %d", &status_code) != 1)
     {
         free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
+    }
+
+    bool server_wants_close = false;
+    char *conn_hdr = strcasestr(buf, "Connection:");
+    if (conn_hdr && conn_hdr < header_end && strncasecmp(conn_hdr + 11, " close", 6) == 0)
+    {
+        server_wants_close = true;
     }
 
     if (status_code == 202)
     {
         free(buf);
+        if (server_wants_close || !sock_ptr)
+        {
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+        }
         return 1; // Still running
     }
 
@@ -307,24 +375,33 @@ static int retrieve_task(const char *host, int port, const char *task_id,
         fprintf(stderr, "%s[!] 401 Unauthorized: Invalid token or authentication required%s\n",
                 use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
         free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -3;
     }
 
     if (status_code == 404)
     {
         free(buf);
+        if (server_wants_close || !sock_ptr)
+        {
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+        }
         return -2; // Not found
     }
 
     if (status_code != 200)
     {
         free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
     *exit_code = 0;
     char *code_hdr = strcasestr(buf, "X-Task-Exit-Code:");
-    if (code_hdr)
+    if (code_hdr && code_hdr < header_end)
     {
         sscanf(code_hdr + 17, "%d", exit_code);
     }
@@ -333,40 +410,90 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     {
         *artifacts_count = 0;
         char *art_hdr = strcasestr(buf, "X-Artifacts-Count:");
-        if (art_hdr)
+        if (art_hdr && art_hdr < header_end)
         {
             sscanf(art_hdr + 18, "%d", artifacts_count);
         }
     }
 
-    char *body_start = strstr(buf, "\r\n\r\n");
-    if (!body_start)
+    size_t content_len = 0;
+    char *cl = strcasestr(buf, "Content-Length:");
+    if (cl && cl < header_end)
     {
-        free(buf);
-        return -1;
+        content_len = (size_t)strtoull(cl + 15, NULL, 10);
     }
-    body_start += 4;
 
-    size_t b_len = (size_t)(buf + total_read - body_start);
-    char *out = malloc(b_len + 1);
+    char *body_start = header_end + 4;
+    size_t body_already_read = (size_t)(buf + total_read - body_start);
+
+    // Read remaining body up to Content-Length
+    while (body_already_read < content_len)
+    {
+        if (total_read >= capacity - 1)
+        {
+            size_t body_offset = (size_t)(body_start - buf);
+            capacity *= 2;
+            char *nb = realloc(buf, capacity);
+            if (!nb)
+            {
+                free(buf);
+                close(sock);
+                if (sock_ptr) *sock_ptr = -1;
+                return -1;
+            }
+            buf = nb;
+            body_start = buf + body_offset;
+        }
+        size_t needed = content_len - body_already_read;
+        size_t space = capacity - 1 - total_read;
+        size_t to_read = needed < space ? needed : space;
+        ssize_t n = read(sock, buf + total_read, to_read);
+        if (n <= 0) break;
+        total_read += (size_t)n;
+        body_already_read += (size_t)n;
+    }
+
+    char *out = malloc(body_already_read + 1);
     if (out)
     {
-        memcpy(out, body_start, b_len);
-        out[b_len] = '\0';
+        memcpy(out, body_start, body_already_read);
+        out[body_already_read] = '\0';
         *output_body = out;
-        *output_len = b_len;
+        *output_len = body_already_read;
     }
 
     free(buf);
+
+    if (server_wants_close || !sock_ptr)
+    {
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+    }
     return 0; // Completed
 }
 
-/* Download an artifact file from GET /retrieve/<taskId>/artifact/<filename> */
-static int download_artifact(const char *host, int port, const char *task_id, const char *artifact_name)
+static int retrieve_task(const char *host, int port, const char *task_id,
+                         int *exit_code, int *artifacts_count, char **output_body, size_t *output_len)
 {
-    int sock = connect_to_server(host, port);
-    if (sock < 0)
-        return -1;
+    return retrieve_task_conn(NULL, host, port, task_id, exit_code, artifacts_count, output_body, output_len);
+}
+
+/* Download an artifact file with persistent socket reuse */
+static int download_artifact_conn(int *sock_ptr, const char *host, int port, const char *task_id, const char *artifact_name)
+{
+    int sock = -1;
+    if (sock_ptr && *sock_ptr >= 0)
+    {
+        sock = *sock_ptr;
+    }
+    else
+    {
+        sock = connect_to_server(host, port);
+        if (sock < 0)
+            return -1;
+        if (sock_ptr)
+            *sock_ptr = sock;
+    }
 
     char auth_hdr[300] = {0};
     append_auth_header(auth_hdr, sizeof(auth_hdr));
@@ -376,14 +503,23 @@ static int download_artifact(const char *host, int port, const char *task_id, co
         "GET /retrieve/%s/artifact/%s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "%s"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n",
         task_id, artifact_name, host, port, auth_hdr);
 
     if (write(sock, request, req_len) != req_len)
     {
         close(sock);
-        return -1;
+        if (sock_ptr) *sock_ptr = -1;
+        sock = connect_to_server(host, port);
+        if (sock < 0) return -1;
+        if (sock_ptr) *sock_ptr = sock;
+        if (write(sock, request, req_len) != req_len)
+        {
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+            return -1;
+        }
     }
 
     // Read header first
@@ -393,6 +529,7 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     if (!buf)
     {
         close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
@@ -409,7 +546,7 @@ static int download_artifact(const char *host, int port, const char *task_id, co
         {
             cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); close(sock); return -1; }
+            if (!nb) { free(buf); close(sock); if (sock_ptr) *sock_ptr = -1; return -1; }
             buf = nb;
         }
     }
@@ -418,6 +555,7 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     {
         free(buf);
         close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
@@ -426,18 +564,27 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     {
         free(buf);
         close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
     size_t content_len = 0;
     char *cl = strcasestr(buf, "Content-Length:");
-    if (cl)
+    if (cl && cl < header_end)
     {
         content_len = (size_t)strtoull(cl + 15, NULL, 10);
     }
 
+    bool server_wants_close = false;
+    char *conn_hdr = strcasestr(buf, "Connection:");
+    if (conn_hdr && conn_hdr < header_end && strncasecmp(conn_hdr + 11, " close", 6) == 0)
+    {
+        server_wants_close = true;
+    }
+
     char *body = header_end + 4;
     size_t body_in_buf = (size_t)(buf + total - body);
+    if (body_in_buf > content_len) body_in_buf = content_len;
 
     mkdir_p_parent(artifact_name);
     int out_fd = open(artifact_name, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -445,6 +592,7 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     {
         free(buf);
         close(sock);
+        if (sock_ptr) *sock_ptr = -1;
         return -1;
     }
 
@@ -457,7 +605,9 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     while (written < content_len)
     {
         char chunk[16384];
-        ssize_t n = read(sock, chunk, sizeof(chunk));
+        size_t to_read = sizeof(chunk);
+        if (content_len - written < to_read) to_read = content_len - written;
+        ssize_t n = read(sock, chunk, to_read);
         if (n <= 0)
             break;
         write(out_fd, chunk, (size_t)n);
@@ -465,11 +615,21 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     }
 
     close(out_fd);
-    close(sock);
     free(buf);
+
+    if (server_wants_close || !sock_ptr)
+    {
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+    }
 
     chmod(artifact_name, 0755);
     return 0;
+}
+
+__attribute__((unused)) static int download_artifact(const char *host, int port, const char *task_id, const char *artifact_name)
+{
+    return download_artifact_conn(NULL, host, port, task_id, artifact_name);
 }
 
 /* Dispatch binary multi-file envelope workflow */
@@ -623,31 +783,43 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         "Content-Type: application/octet-stream\r\n"
         "Content-Length: %zu\r\n"
         "%s"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n",
         host, port, envelope_size, auth_hdr);
 
-    if (write(sock, req_headers, hlen) != hlen)
-    {
-        perror("write headers");
-        close(sock);
-        free(envelope);
-        return 1;
-    }
+    // Vectored I/O: send headers and envelope in single atomic syscall
+    struct iovec iov[2];
+    iov[0].iov_base = req_headers;
+    iov[0].iov_len = (size_t)hlen;
+    iov[1].iov_base = (void *)envelope;
+    iov[1].iov_len = envelope_size;
 
-    size_t written = 0;
-    while (written < envelope_size)
+    size_t total_to_write = (size_t)hlen + envelope_size;
+    size_t total_written = 0;
+    while (total_written < total_to_write)
     {
-        ssize_t w = write(sock, envelope + written, envelope_size - written);
+        ssize_t w = writev(sock, iov, 2);
         if (w <= 0)
         {
-            if (w < 0 && errno == EINTR) continue;
-            perror("write envelope body");
+            if (w < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            perror("writev envelope");
             close(sock);
             free(envelope);
             return 1;
         }
-        written += (size_t)w;
+        total_written += (size_t)w;
+        if ((size_t)w >= iov[0].iov_len)
+        {
+            size_t rem = (size_t)w - iov[0].iov_len;
+            iov[0].iov_len = 0;
+            iov[1].iov_base = (char *)iov[1].iov_base + rem;
+            iov[1].iov_len -= rem;
+        }
+        else
+        {
+            iov[0].iov_base = (char *)iov[0].iov_base + w;
+            iov[0].iov_len -= (size_t)w;
+        }
     }
     free(envelope);
 
@@ -663,12 +835,12 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         if (strstr(resp_buf, "\r\n\r\n"))
             break;
     }
-    close(sock);
 
     if (total_resp == 0)
     {
         fprintf(stderr, "%s[!] Empty response from server on workflow submit%s\n",
                 use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        close(sock);
         return 1;
     }
 
@@ -685,6 +857,7 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
             fprintf(stderr, "%s[!] Workflow submission failed (HTTP %d):\n%s%s\n",
                     use_colors ? COLOR_RED : "", status_code, resp_buf, use_colors ? COLOR_RESET : "");
         }
+        close(sock);
         return 1;
     }
 
@@ -698,6 +871,7 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     {
         fprintf(stderr, "%s[!] No X-Task-Id returned from server%s\n",
                 use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        close(sock);
         return 1;
     }
 
@@ -706,7 +880,10 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     printf("%s[*] Streaming execution logs from server OS Page Cache...%s\n\n",
            use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
 
-    // Poll for completion
+    // Keep the warm connection open for status polling and artifact download!
+    int poll_sock = sock;
+    useconds_t poll_sleep_us = 1000; // start at 1ms sub-millisecond adaptive backoff
+
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -717,20 +894,27 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
 
     while (1)
     {
-        int res = retrieve_task(host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
+        int res = retrieve_task_conn(&poll_sock, host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
         if (res == 0)
         {
             // Completed!
             break;
         }
-        else if (res == -2)
+        else if (res == 1) // 202 Still running
         {
-            usleep(20000); // 20ms
+            usleep(poll_sleep_us);
+            if (poll_sleep_us < 8000) poll_sleep_us *= 2;
+        }
+        else if (res == -2) // 404
+        {
+            usleep(poll_sleep_us);
+            if (poll_sleep_us < 8000) poll_sleep_us *= 2;
         }
         else if (res < 0)
         {
             fprintf(stderr, "%s[!] Network error retrieving workflow status%s\n",
                     use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+            if (poll_sock >= 0) close(poll_sock);
             return 1;
         }
 
@@ -741,10 +925,9 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         {
             fprintf(stderr, "%s[!] Workflow execution timed out after %ds%s\n",
                     use_colors ? COLOR_RED : "", timeout_sec, use_colors ? COLOR_RESET : "");
+            if (poll_sock >= 0) close(poll_sock);
             return 124;
         }
-
-        usleep(50000); // 50ms polling
     }
 
     // Print full execution log
@@ -760,13 +943,14 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     {
         printf("\n%s[✗] Workflow FAILED with exit code %d%s\n",
                use_colors ? COLOR_RED : "", exit_code, use_colors ? COLOR_RESET : "");
+        if (poll_sock >= 0) close(poll_sock);
         return exit_code;
     }
 
     printf("\n%s[✓] Workflow Completed Successfully (Exit Code: 0)!%s\n",
            use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "");
 
-    // Stage 5: Zero-copy artifact retrieval
+    // Stage 5: Zero-copy artifact retrieval over the warm connection
     if (manifest.num_required_artifacts > 0)
     {
         printf("%s[*] Downloading %d required artifact(s) via zero-copy sendfile()...%s\n",
@@ -779,7 +963,7 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
                    use_colors ? COLOR_BLUE : "", art, use_colors ? COLOR_RESET : "");
             fflush(stdout);
 
-            if (download_artifact(host, port, task_id, art) == 0)
+            if (download_artifact_conn(&poll_sock, host, port, task_id, art) == 0)
             {
                 struct stat ast;
                 stat(art, &ast);
@@ -792,6 +976,12 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
                        use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
             }
         }
+    }
+
+    if (poll_sock >= 0)
+    {
+        close(poll_sock);
+        poll_sock = -1;
     }
 
     return 0;
