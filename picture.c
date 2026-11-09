@@ -36,7 +36,7 @@ static void handle_sigint(int sig) {
 }
 
 typedef struct {
-    char task_id[64];
+    char task_id[256];
     char workflow_name[128];
     pid_t pid;
     char command[256];
