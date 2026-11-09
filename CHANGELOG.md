@@ -6,6 +6,30 @@ All notable milestones, git commits, optimization breakthroughs, and architectur
 
 ## Git Commit History
 
+### `HEAD` — `Token Auth, Worker Sandboxing, Richer JSON & Ambient Console`
+- **Date**: Tue Nov 10 00:15:00 2026 +0530
+- **Author**: Meet Dawda
+- **Summary**:
+  - **Authentication & Security**:
+    - Added token-based HTTP protection: `--token <secret>` / `-k <secret>` flag, `JULY_TOKEN` environment variable, or persistent `~/.july/token`.
+    - Protected all endpoints (`POST /task`, `POST /workflow`, `GET /retrieve`) via `X-July-Token` and `Authorization: Bearer` headers.
+    - Added `401 Unauthorized` responses and clear terminal warnings on unauthorized dispatch attempts.
+  - **Worker Sandboxing**:
+    - Kernel resource limits via `setrlimit()`: Virtual memory cap (`RLIMIT_AS`), process count limits (`RLIMIT_NPROC` to stop fork-bombs), and execution time caps (`RLIMIT_CPU`).
+    - Linux namespace isolation (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, `CLONE_NEWIPC`).
+    - Default offline sandbox via `CLONE_NEWNET` (loopback only) unless network access is explicitly enabled.
+    - Failure artifact harvesting: stages crash logs or dumps if builds exit with non-zero status codes.
+  - **Richer JSON Workflow Manifests**:
+    - Custom environment variable injection (`"env": { "KEY": "VAL" }`).
+    - Sandbox configuration block (`"sandbox": { "network": false, "memory_mb": 1024, "max_pids": 64, "namespace": true }`).
+    - Dual artifact collection (`"artifacts": { "required": [...], "on_failure": [...] }`).
+  - **Interactive Ambient Developer Console**:
+    - Replaced basic REPL with an interactive console (`july(target)> `).
+    - Supports `run <manifest.json> [files...]`, `status` / `ping` round-trip probing, and remote shell execution.
+    - Clean disconnection when closing the console or closing the laptop lid.
+
+---
+
 ### `HEAD` — `Multi-Application Remote Test Suite & Polyglot Pipelines`
 - **Date**: Mon Nov 9 23:30:00 2026 +0530
 - **Author**: Meet Dawda

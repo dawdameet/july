@@ -24,6 +24,14 @@
 #define MAX_CMD_LEN 1024
 #define MAX_ARTIFACTS 64
 #define MAX_PATH_LEN 256
+#define MAX_ENV_VARS 32
+#define MAX_ENV_KEY 64
+#define MAX_ENV_VAL 256
+
+typedef struct {
+    char key[MAX_ENV_KEY];
+    char val[MAX_ENV_VAL];
+} WorkflowEnvVar;
 
 typedef struct {
     char name[MAX_WORKFLOW_NAME];
@@ -31,6 +39,16 @@ typedef struct {
     bool kill_if_timeout;
     bool from_github;
     char github_link[MAX_GITHUB_LINK];
+
+    // Sandbox constraints
+    bool sandbox_network;       // false = loopback only (default), true = allow network
+    int sandbox_memory_mb;      // memory cap in MB (0 = default/unlimited)
+    int sandbox_max_pids;       // process count cap (0 = default 128)
+    bool sandbox_namespace;     // full Linux namespaces
+
+    // Custom environment variables
+    int num_env_vars;
+    WorkflowEnvVar env_vars[MAX_ENV_VARS];
 
     int num_check_tools;
     char check_tools[MAX_TOOLS][MAX_TOOL_NAME];
@@ -43,6 +61,9 @@ typedef struct {
 
     int num_required_artifacts;
     char required_artifacts[MAX_ARTIFACTS][MAX_PATH_LEN];
+
+    int num_failure_artifacts;
+    char failure_artifacts[MAX_ARTIFACTS][MAX_PATH_LEN];
 } WorkflowManifest;
 
 /* ---------------- Little-Endian Helpers ---------------- */
@@ -362,6 +383,95 @@ static inline int parse_workflow_manifest(const char *json, size_t len, Workflow
             m->num_build_cmds = cnt;
             for (int k = 0; k < cnt; k++) {
                 safe_copy_str(m->build_cmds[k], sizeof(m->build_cmds[k]), tmp[k]);
+            }
+        } else if (strcmp(key, "env") == 0) {
+            if (p < end && *p == '{') {
+                p++;
+                while (p < end && m->num_env_vars < MAX_ENV_VARS) {
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == '}') { p++; break; }
+                    char env_k[MAX_ENV_KEY];
+                    if (!parse_json_string(&p, end, env_k, sizeof(env_k))) break;
+                    p = skip_json_ws(p, end);
+                    if (p >= end || *p != ':') break;
+                    p++;
+                    p = skip_json_ws(p, end);
+                    char env_v[MAX_ENV_VAL];
+                    if (!parse_json_string(&p, end, env_v, sizeof(env_v))) break;
+                    safe_copy_str(m->env_vars[m->num_env_vars].key, sizeof(m->env_vars[m->num_env_vars].key), env_k);
+                    safe_copy_str(m->env_vars[m->num_env_vars].val, sizeof(m->env_vars[m->num_env_vars].val), env_v);
+                    m->num_env_vars++;
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == ',') p++;
+                }
+            } else {
+                p = skip_json_value(p, end);
+            }
+        } else if (strcmp(key, "sandbox") == 0) {
+            if (p < end && *p == '{') {
+                p++;
+                while (p < end) {
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == '}') { p++; break; }
+                    char sb_k[64];
+                    if (!parse_json_string(&p, end, sb_k, sizeof(sb_k))) break;
+                    p = skip_json_ws(p, end);
+                    if (p >= end || *p != ':') break;
+                    p++;
+                    p = skip_json_ws(p, end);
+                    if (strcmp(sb_k, "network") == 0) {
+                        parse_json_bool(&p, end, &m->sandbox_network);
+                    } else if (strcmp(sb_k, "memory_mb") == 0) {
+                        parse_json_int(&p, end, &m->sandbox_memory_mb);
+                    } else if (strcmp(sb_k, "max_pids") == 0) {
+                        parse_json_int(&p, end, &m->sandbox_max_pids);
+                    } else if (strcmp(sb_k, "namespace") == 0) {
+                        parse_json_bool(&p, end, &m->sandbox_namespace);
+                    } else {
+                        p = skip_json_value(p, end);
+                    }
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == ',') p++;
+                }
+            } else {
+                p = skip_json_value(p, end);
+            }
+        } else if (strcmp(key, "artifacts") == 0) {
+            if (p < end && *p == '{') {
+                p++;
+                while (p < end) {
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == '}') { p++; break; }
+                    char art_k[64];
+                    if (!parse_json_string(&p, end, art_k, sizeof(art_k))) break;
+                    p = skip_json_ws(p, end);
+                    if (p >= end || *p != ':') break;
+                    p++;
+                    p = skip_json_ws(p, end);
+                    if (strcmp(art_k, "required") == 0) {
+                        char tmp[MAX_ARTIFACTS][MAX_CMD_LEN];
+                        int cnt = 0;
+                        parse_json_string_array(&p, end, tmp, &cnt, MAX_ARTIFACTS);
+                        m->num_required_artifacts = cnt;
+                        for (int k = 0; k < cnt; k++) {
+                            safe_copy_str(m->required_artifacts[k], sizeof(m->required_artifacts[k]), tmp[k]);
+                        }
+                    } else if (strcmp(art_k, "on_failure") == 0) {
+                        char tmp[MAX_ARTIFACTS][MAX_CMD_LEN];
+                        int cnt = 0;
+                        parse_json_string_array(&p, end, tmp, &cnt, MAX_ARTIFACTS);
+                        m->num_failure_artifacts = cnt;
+                        for (int k = 0; k < cnt; k++) {
+                            safe_copy_str(m->failure_artifacts[k], sizeof(m->failure_artifacts[k]), tmp[k]);
+                        }
+                    } else {
+                        p = skip_json_value(p, end);
+                    }
+                    p = skip_json_ws(p, end);
+                    if (p < end && *p == ',') p++;
+                }
+            } else {
+                p = skip_json_value(p, end);
             }
         } else if (strcmp(key, "required_artifacts") == 0) {
             char tmp[MAX_ARTIFACTS][MAX_CMD_LEN];

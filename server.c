@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +13,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <stdint.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -23,12 +27,59 @@
 #if defined(__APPLE__)
 #include <sys/event.h>
 #else
+#include <sched.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #endif
 
 #include "task.h"
 #include "workflow.h"
+
+static char g_auth_token[256] = {0};
+
+static inline bool is_request_authenticated(const char *headers, size_t header_len)
+{
+    if (g_auth_token[0] == '\0')
+        return true; // Open LAN mode
+
+    if (!headers || header_len == 0)
+        return false;
+
+    // 1. Check "X-July-Token: <token>"
+    const char *tok = strcasestr(headers, "X-July-Token:");
+    if (tok && (size_t)(tok - headers) < header_len)
+    {
+        tok += 13;
+        while (*tok == ' ' || *tok == '\t') tok++;
+        const char *eol = strpbrk(tok, "\r\n");
+        size_t tok_len = eol ? (size_t)(eol - tok) : strlen(tok);
+        if (tok_len == strlen(g_auth_token) && strncmp(tok, g_auth_token, tok_len) == 0)
+            return true;
+    }
+
+    // 2. Check "Authorization: Bearer <token>"
+    const char *auth = strcasestr(headers, "Authorization: Bearer ");
+    if (auth && (size_t)(auth - headers) < header_len)
+    {
+        auth += 22;
+        while (*auth == ' ' || *auth == '\t') auth++;
+        const char *eol = strpbrk(auth, "\r\n");
+        size_t tok_len = eol ? (size_t)(eol - auth) : strlen(auth);
+        if (tok_len == strlen(g_auth_token) && strncmp(auth, g_auth_token, tok_len) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static const char response_401[] =
+    "HTTP/1.1 401 Unauthorized\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 32\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "401 Unauthorized: Invalid Token\n";
+static const size_t response_401_len = sizeof(response_401) - 1;
 
 #define PORT 8080
 #define INITIAL_BUFFER_SIZE 8192
@@ -284,7 +335,8 @@ static int task_result_get(const char *task_id, TaskStatus *status, int *exit_co
 /* ---------------- Process Group & Command Execution in Sandbox ---------------- */
 
 static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
-                                  int log_fd, int timeout_sec, bool kill_if_timeout)
+                                  int log_fd, int timeout_sec, bool kill_if_timeout,
+                                  const WorkflowManifest *manifest)
 {
     int pipefd[2];
     if (pipe(pipefd) < 0)
@@ -316,7 +368,60 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
             exit(127);
         }
 
-        // 4. Execute
+        // 4. Inject Custom Environment Variables
+        if (manifest)
+        {
+            for (int e = 0; e < manifest->num_env_vars; e++)
+            {
+                setenv(manifest->env_vars[e].key, manifest->env_vars[e].val, 1);
+            }
+        }
+
+        // 5. Apply Sandbox Resource Limits (setrlimit)
+        if (manifest)
+        {
+            if (manifest->sandbox_memory_mb > 0)
+            {
+                struct rlimit rl_mem;
+                rl_mem.rlim_cur = (rlim_t)manifest->sandbox_memory_mb * 1024ULL * 1024ULL;
+                rl_mem.rlim_max = rl_mem.rlim_cur;
+                setrlimit(RLIMIT_AS, &rl_mem);
+            }
+
+            int max_pids = manifest->sandbox_max_pids > 0 ? manifest->sandbox_max_pids : 128;
+            struct rlimit rl_proc;
+            rl_proc.rlim_cur = (rlim_t)max_pids;
+            rl_proc.rlim_max = (rlim_t)max_pids;
+            setrlimit(RLIMIT_NPROC, &rl_proc);
+
+            if (timeout_sec > 0)
+            {
+                struct rlimit rl_cpu;
+                rl_cpu.rlim_cur = (rlim_t)(timeout_sec + 5);
+                rl_cpu.rlim_max = (rlim_t)(timeout_sec + 5);
+                setrlimit(RLIMIT_CPU, &rl_cpu);
+            }
+        }
+
+        // 6. Linux Kernel Namespaces Isolation (User, Mount, PID, Network)
+#if defined(__linux__)
+        if (manifest && manifest->sandbox_namespace)
+        {
+            int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC;
+            if (!manifest->sandbox_network)
+            {
+                flags |= CLONE_NEWNET; // loopback only
+            }
+            unshare(CLONE_NEWUSER | flags);
+        }
+        else if (manifest && !manifest->sandbox_network)
+        {
+            // Drop network access by default if offline sandbox
+            unshare(CLONE_NEWNET);
+        }
+#endif
+
+        // 7. Execute
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         perror("execl /bin/sh");
         exit(127);
@@ -536,6 +641,18 @@ int execute_workflow_task(const Task *task)
     free(env_data);
 
     dprintf(log_fd, "=== July Workflow: %s (Task ID: %s) ===\n", manifest.name, task->taskId);
+    if (manifest.sandbox_memory_mb > 0 || manifest.sandbox_max_pids > 0 || manifest.sandbox_namespace || !manifest.sandbox_network)
+    {
+        dprintf(log_fd, "[Sandbox] Config: net=%s, mem=%dMB, pids=%d, ns=%s\n",
+                manifest.sandbox_network ? "host" : "loopback",
+                manifest.sandbox_memory_mb,
+                manifest.sandbox_max_pids > 0 ? manifest.sandbox_max_pids : 128,
+                manifest.sandbox_namespace ? "enabled" : "disabled");
+    }
+    if (manifest.num_env_vars > 0)
+    {
+        dprintf(log_fd, "[Env] Injected %d custom environment variable(s)\n", manifest.num_env_vars);
+    }
 
     int exit_code = 0;
 
@@ -563,7 +680,7 @@ int execute_workflow_task(const Task *task)
         dprintf(log_fd, "[Deps] Cloning from GitHub: %s\n", manifest.github_link);
         char git_cmd[1024];
         snprintf(git_cmd, sizeof(git_cmd), "git clone --depth 1 %s .", manifest.github_link);
-        int rc = run_command_in_sandbox(git_cmd, sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        int rc = run_command_in_sandbox(git_cmd, sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
         if (rc != 0)
         {
             dprintf(log_fd, "[Deps] Git clone failed with exit code %d\n", rc);
@@ -575,7 +692,7 @@ int execute_workflow_task(const Task *task)
     for (int i = 0; i < manifest.num_deps; i++)
     {
         dprintf(log_fd, "[Deps] Executing: %s\n", manifest.deps[i]);
-        int rc = run_command_in_sandbox(manifest.deps[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        int rc = run_command_in_sandbox(manifest.deps[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
         if (rc != 0)
         {
             dprintf(log_fd, "[Deps] Dependency failed with exit code %d\n", rc);
@@ -588,7 +705,7 @@ int execute_workflow_task(const Task *task)
     for (int i = 0; i < manifest.num_build_cmds; i++)
     {
         dprintf(log_fd, "[Build] Executing: %s\n", manifest.build_cmds[i]);
-        int rc = run_command_in_sandbox(manifest.build_cmds[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        int rc = run_command_in_sandbox(manifest.build_cmds[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
         if (rc != 0)
         {
             dprintf(log_fd, "[Build] Command failed with exit code %d\n", rc);
@@ -621,6 +738,25 @@ finish_workflow:
             else
             {
                 dprintf(log_fd, "[Artifacts] Warning: Required artifact '%s' could not be found or staged.\n", art);
+            }
+        }
+    }
+    else if (manifest.num_failure_artifacts > 0)
+    {
+        for (int i = 0; i < manifest.num_failure_artifacts; i++)
+        {
+            const char *art = manifest.failure_artifacts[i];
+            char src_path[1024], dst_path[1024];
+            snprintf(src_path, sizeof(src_path), "%s/%s", sandbox_dir, art);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", artifacts_dir, art);
+
+            mkdir_p_parent(dst_path);
+            if (rename(src_path, dst_path) == 0 || copy_file(src_path, dst_path) == 0)
+            {
+                struct stat ast;
+                stat(dst_path, &ast);
+                dprintf(log_fd, "[Artifacts:Failure] Staged '%s' (%ld bytes)\n", art, (long)ast.st_size);
+                staged_count++;
             }
         }
     }
@@ -1134,6 +1270,19 @@ static int prepare_response(Connection *conn, size_t request_len)
     conn->input[request_len] = '\0';
     conn->close_after_write = request_wants_close(conn->input, conn->header_bytes);
 
+    // Authentication enforcement
+    if (!is_request_authenticated(conn->input, conn->header_bytes))
+    {
+        write_response(conn, response_401, response_401_len);
+        conn->input_len -= request_len;
+        if (conn->input_len > 0)
+        {
+            memmove(conn->input, conn->input + request_len, conn->input_len);
+        }
+        conn->input[conn->input_len] = '\0';
+        return 0;
+    }
+
     if (conn->input[0] == 'G' && strncmp(conn->input, "GET ", 4) == 0)
     {
         if (strncmp(conn->input + 4, "/ ", 2) == 0)
@@ -1454,6 +1603,14 @@ static void print_server_network_banner(int port, const char *backend)
     printf("│  July Task & Workflow Engine (%-6s backend)            │\n", backend);
     printf("│  Listening on: 0.0.0.0:%-5d (All LAN interfaces)          │\n", port);
     printf("│  Worker Pool:  %d threads                                   │\n", NUM_WORKERS);
+    if (g_auth_token[0] != '\0')
+    {
+        printf("│  Auth Mode:    Protected (Token Enforced)                   │\n");
+    }
+    else
+    {
+        printf("│  Auth Mode:    Open LAN (No token configured)               │\n");
+    }
     printf("├─────────────────────────────────────────────────────────────┤\n");
     printf("│  Connect with dispatcher from your Mac / LAN:               │\n");
 
@@ -1498,18 +1655,50 @@ int main(int argc, char **argv)
     srand((unsigned int)time(NULL));
 
     int port = PORT;
-    if (argc > 1)
-    {
-        int p = atoi(argv[1]);
-        if (p > 0 && p <= 65535)
-            port = p;
-    }
     const char *env_port = getenv("PORT");
     if (env_port)
     {
         int p = atoi(env_port);
         if (p > 0 && p <= 65535)
             port = p;
+    }
+
+    const char *env_tok = getenv("JULY_TOKEN");
+    if (env_tok) safe_copy_str(g_auth_token, sizeof(g_auth_token), env_tok);
+
+    for (int i = 1; i < argc; i++)
+    {
+        if ((strcmp(argv[i], "--token") == 0 || strcmp(argv[i], "-k") == 0) && i + 1 < argc)
+        {
+            safe_copy_str(g_auth_token, sizeof(g_auth_token), argv[++i]);
+        }
+        else if (argv[i][0] != '-')
+        {
+            int p = atoi(argv[i]);
+            if (p > 0 && p <= 65535)
+                port = p;
+        }
+    }
+
+    if (g_auth_token[0] == '\0')
+    {
+        char token_file[512];
+        const char *home = getenv("HOME");
+        if (home)
+        {
+            snprintf(token_file, sizeof(token_file), "%s/.july/token", home);
+            FILE *tf = fopen(token_file, "r");
+            if (tf)
+            {
+                if (fgets(g_auth_token, sizeof(g_auth_token), tf))
+                {
+                    size_t tlen = strlen(g_auth_token);
+                    while (tlen > 0 && (g_auth_token[tlen - 1] == '\r' || g_auth_token[tlen - 1] == '\n' || g_auth_token[tlen - 1] == ' '))
+                        g_auth_token[--tlen] = '\0';
+                }
+                fclose(tf);
+            }
+        }
     }
 
     pthread_mutex_init(&queue.lock, NULL);

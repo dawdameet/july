@@ -35,6 +35,17 @@
 #define COLOR_MAGENTA "\033[1;35m"
 
 static bool use_colors = true;
+static char g_auth_token[256] = {0};
+
+static inline int append_auth_header(char *buf, size_t max_buf)
+{
+    if (g_auth_token[0] != '\0')
+    {
+        return snprintf(buf, max_buf, "X-July-Token: %s\r\n", g_auth_token);
+    }
+    buf[0] = '\0';
+    return 0;
+}
 
 static inline void pack_uint32_le(uint8_t *dst, uint32_t val)
 {
@@ -148,15 +159,19 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
     memcpy(payload + sizeof(TaskHeader), task_id, id_len);
     memcpy(payload + sizeof(TaskHeader) + id_len, command, cmd_len);
 
+    char auth_hdr[300] = {0};
+    append_auth_header(auth_hdr, sizeof(auth_hdr));
+
     char headers[512];
     int header_len = snprintf(headers, sizeof(headers),
         "POST /task HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Content-Type: application/octet-stream\r\n"
         "Content-Length: %zu\r\n"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
-        host, port, payload_len);
+        host, port, payload_len, auth_hdr);
 
     int sock = connect_to_server(host, port);
     if (sock < 0)
@@ -199,8 +214,16 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
     int status_code = 0;
     if (sscanf(response, "HTTP/1.1 %d", &status_code) != 1 || status_code != 202)
     {
-        fprintf(stderr, "%s[!] Task submission rejected (HTTP %d)%s\n",
-                use_colors ? COLOR_RED : "", status_code, use_colors ? COLOR_RESET : "");
+        if (status_code == 401)
+        {
+            fprintf(stderr, "%s[!] 401 Unauthorized: Remote worker requires authentication! Set JULY_TOKEN or pass --token <token>%s\n",
+                    use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        }
+        else
+        {
+            fprintf(stderr, "%s[!] Task submission rejected (HTTP %d)%s\n",
+                    use_colors ? COLOR_RED : "", status_code, use_colors ? COLOR_RESET : "");
+        }
         return -1;
     }
 
@@ -215,13 +238,17 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     if (sock < 0)
         return -1;
 
-    char request[256];
+    char auth_hdr[300] = {0};
+    append_auth_header(auth_hdr, sizeof(auth_hdr));
+
+    char request[512];
     int req_len = snprintf(request, sizeof(request),
         "GET /retrieve/%s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
-        task_id, host, port);
+        task_id, host, port, auth_hdr);
 
     if (write(sock, request, req_len) != req_len)
     {
@@ -273,6 +300,14 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     {
         free(buf);
         return 1; // Still running
+    }
+
+    if (status_code == 401)
+    {
+        fprintf(stderr, "%s[!] 401 Unauthorized: Invalid token or authentication required%s\n",
+                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        free(buf);
+        return -3;
     }
 
     if (status_code == 404)
@@ -333,13 +368,17 @@ static int download_artifact(const char *host, int port, const char *task_id, co
     if (sock < 0)
         return -1;
 
+    char auth_hdr[300] = {0};
+    append_auth_header(auth_hdr, sizeof(auth_hdr));
+
     char request[512];
     int req_len = snprintf(request, sizeof(request),
         "GET /retrieve/%s/artifact/%s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
-        task_id, artifact_name, host, port);
+        task_id, artifact_name, host, port, auth_hdr);
 
     if (write(sock, request, req_len) != req_len)
     {
@@ -574,15 +613,19 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         return 1;
     }
 
+    char auth_hdr[300] = {0};
+    append_auth_header(auth_hdr, sizeof(auth_hdr));
+
     char req_headers[512];
     int hlen = snprintf(req_headers, sizeof(req_headers),
         "POST /workflow HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Content-Type: application/octet-stream\r\n"
         "Content-Length: %zu\r\n"
+        "%s"
         "Connection: close\r\n"
         "\r\n",
-        host, port, envelope_size);
+        host, port, envelope_size, auth_hdr);
 
     if (write(sock, req_headers, hlen) != hlen)
     {
@@ -632,8 +675,16 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     int status_code = 0;
     if (sscanf(resp_buf, "HTTP/1.1 %d", &status_code) != 1 || status_code != 202)
     {
-        fprintf(stderr, "%s[!] Workflow submission failed (HTTP %d):\n%s%s\n",
-                use_colors ? COLOR_RED : "", status_code, resp_buf, use_colors ? COLOR_RESET : "");
+        if (status_code == 401)
+        {
+            fprintf(stderr, "%s[!] 401 Unauthorized: Remote worker requires authentication! Set JULY_TOKEN or pass --token <token>%s\n",
+                    use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        }
+        else
+        {
+            fprintf(stderr, "%s[!] Workflow submission failed (HTTP %d):\n%s%s\n",
+                    use_colors ? COLOR_RED : "", status_code, resp_buf, use_colors ? COLOR_RESET : "");
+        }
         return 1;
     }
 
@@ -756,11 +807,12 @@ static void print_help(const char *prog)
     printf("  %s workflow <manifest.json> [files...]\n\n", prog);
     printf("  # Shell Command Execution:\n");
     printf("  %s [host:port] \"<command>\"\n", prog);
-    printf("  %s [host:port]                     (Interactive REPL targeting host)\n", prog);
-    printf("  %s                                 (Interactive REPL default localhost:8080)\n\n", prog);
+    printf("  %s [host:port]                     (Interactive developer console)\n", prog);
+    printf("  %s                                 (Interactive console targeting default localhost:8080)\n\n", prog);
     printf("Options:\n");
     printf("  -h, --host <host>       Server IP or hostname (default: %s)\n", DEFAULT_HOST);
     printf("  -p, --port <port>       Server port (default: %d)\n", DEFAULT_PORT);
+    printf("  -k, --token <token>     Authentication token (or set JULY_TOKEN)\n");
     printf("  -t, --timeout <sec>     Execution timeout in seconds (default: %d)\n", DEFAULT_TIMEOUT_SEC);
     printf("  -g, --get <taskId>      Retrieve output or artifact status of a task\n");
     printf("  --no-color              Disable ANSI color output\n");
@@ -786,6 +838,8 @@ int main(int argc, char **argv)
     if (env_host) safe_copy_str(host, sizeof(host), env_host);
     const char *env_port = getenv("DISPATCHER_PORT");
     if (env_port) port = atoi(env_port);
+    const char *env_tok = getenv("JULY_TOKEN");
+    if (env_tok) safe_copy_str(g_auth_token, sizeof(g_auth_token), env_tok);
 
     bool host_set_by_pos = false;
     bool workflow_mode = false;
@@ -802,6 +856,10 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--no-color") == 0)
         {
             use_colors = false;
+        }
+        else if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--token") == 0) && i + 1 < argc)
+        {
+            safe_copy_str(g_auth_token, sizeof(g_auth_token), argv[++i]);
         }
         else if ((strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--host") == 0) && i + 1 < argc)
         {
@@ -849,6 +907,27 @@ int main(int argc, char **argv)
                 strncat(command_buf, " ", sizeof(command_buf) - strlen(command_buf) - 1);
             }
             strncat(command_buf, argv[i], sizeof(command_buf) - strlen(command_buf) - 1);
+        }
+    }
+
+    if (g_auth_token[0] == '\0')
+    {
+        char token_file[512];
+        const char *home = getenv("HOME");
+        if (home)
+        {
+            snprintf(token_file, sizeof(token_file), "%s/.july/token", home);
+            FILE *tf = fopen(token_file, "r");
+            if (tf)
+            {
+                if (fgets(g_auth_token, sizeof(g_auth_token), tf))
+                {
+                    size_t tlen = strlen(g_auth_token);
+                    while (tlen > 0 && (g_auth_token[tlen - 1] == '\r' || g_auth_token[tlen - 1] == '\n' || g_auth_token[tlen - 1] == ' '))
+                        g_auth_token[--tlen] = '\0';
+                }
+                fclose(tf);
+            }
         }
     }
 
@@ -947,15 +1026,22 @@ int main(int argc, char **argv)
         return exit_code;
     }
 
-    // 4. Interactive REPL
+    // 4. Interactive REPL / Ambient Developer Console
     printf("%s┌─────────────────────────────────────────────────────────────┐%s\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
-    printf("%s│             July Task & Workflow Dispatcher                 │%s\n",
+    printf("%s│             July Interactive Developer Console              │%s\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
-    printf("%s│  Target: %-49s  │%s\n",
+    printf("%s│  Target: %-50s │%s\n",
            use_colors ? COLOR_CYAN : "", host, use_colors ? COLOR_RESET : "");
-    printf("%s│  Port:   %-49d  │%s\n",
+    printf("%s│  Port:   %-50d │%s\n",
            use_colors ? COLOR_CYAN : "", port, use_colors ? COLOR_RESET : "");
+    if (g_auth_token[0] != '\0')
+    {
+        printf("%s│  Auth:   Token Enabled                                      │%s\n",
+               use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
+    }
+    printf("%s│  Type 'help' for commands, 'exit' or Ctrl+D to quit         │%s\n",
+           use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
     printf("%s└─────────────────────────────────────────────────────────────┘%s\n\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
 
@@ -964,7 +1050,7 @@ int main(int argc, char **argv)
 
     while (1)
     {
-        printf("%sdispatcher%s(%s%s:%d%s)> ",
+        printf("%sjuly%s(%s%s:%d%s)> ",
                use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "",
                use_colors ? COLOR_CYAN : "", host, port, use_colors ? COLOR_RESET : "");
         fflush(stdout);
@@ -980,6 +1066,65 @@ int main(int argc, char **argv)
             continue;
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0)
             break;
+
+        if (strncmp(line, "run ", 4) == 0 || strncmp(line, "workflow ", 9) == 0)
+        {
+            char *args[64];
+            int arg_count = 0;
+            char *p = line + (line[0] == 'r' ? 4 : 9);
+            while (*p && arg_count < 64)
+            {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                args[arg_count++] = p;
+                while (*p && *p != ' ') p++;
+                if (*p) *p++ = '\0';
+            }
+            if (arg_count < 1)
+            {
+                printf("%s[!] Usage: run <manifest.json> [files...]%s\n",
+                       use_colors ? COLOR_YELLOW : "", use_colors ? COLOR_RESET : "");
+                continue;
+            }
+            const char *m_file = args[0];
+            int num_f = arg_count - 1;
+            char **f_list = num_f > 0 ? &args[1] : NULL;
+            dispatch_workflow(host, port, m_file, num_f, f_list, timeout_sec);
+            continue;
+        }
+        else if (strcmp(line, "help") == 0)
+        {
+            printf("\n%sJuly Interactive Console Commands:%s\n",
+                   use_colors ? COLOR_BOLD : "", use_colors ? COLOR_RESET : "");
+            printf("  run <manifest.json> [files...]   Bundle and dispatch remote workflow container\n");
+            printf("  workflow <manifest.json> [...]   Alias for 'run'\n");
+            printf("  status / ping                    Check remote worker health & round-trip latency\n");
+            printf("  <command>                        Execute raw remote shell command\n");
+            printf("  help                             Display this help menu\n");
+            printf("  exit / quit                      Disconnect and exit session cleanly\n\n");
+            continue;
+        }
+        else if (strcmp(line, "status") == 0 || strcmp(line, "ping") == 0)
+        {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int s = connect_to_server(host, port);
+            if (s >= 0)
+            {
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                close(s);
+                double rtt = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+                printf("%s[✓] Remote node %s:%d is ONLINE (TCP RTT: %.2f ms)%s\n",
+                       use_colors ? COLOR_GREEN : "", host, port, rtt, use_colors ? COLOR_RESET : "");
+            }
+            else
+            {
+                printf("%s[!] Remote node %s:%d is OFFLINE or unreachable%s\n",
+                       use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
+            }
+            continue;
+        }
 
         char task_id[MAX_TASK_ID];
         snprintf(task_id, sizeof(task_id), "t_%d", task_counter++);
