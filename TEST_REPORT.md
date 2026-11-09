@@ -90,3 +90,4 @@ When output artifacts are downloaded via `GET /retrieve/<taskId>/artifact/<filen
 * **Throughput under Contention**: In-memory KV still achieved **1.37 Mops/s** ($P_{99} = 1\,\mu\text{s}$) while GCC was thrashing the CPU.
 * **Network Throughput**: Transferred **~8.5 MB** of binaries and logs across 4 concurrent TCP connections with zero packet loss or corruption.
 * **Total Parallel Wall Time**: **3.21 seconds** for all 4 workflows combined.
+
