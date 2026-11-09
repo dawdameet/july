@@ -11,13 +11,16 @@ ifneq ($(SYSROOT),)
     CFLAGS_DISPATCHER += -isysroot $(SYSROOT)
 endif
 
-all: dispatcher server
+all: dispatcher server picture
 
 dispatcher: dispatcher.c workflow.h task.h
 	$(CC) $(CFLAGS_DISPATCHER) -o dispatcher dispatcher.c
 
 server: server.c workflow.h task.h
 	$(CC) $(CFLAGS_SERVER) -o server server.c
+
+picture: picture.c
+	$(CC) $(CFLAGS_DISPATCHER) -o picture picture.c
 
 # ---------------- Application Tests ----------------
 
@@ -91,7 +94,7 @@ test-all: test-sysbench test-matrix test-kv test-pipeline test-sandbox
 	@echo "================================================================="
 
 clean:
-	rm -f server dispatcher app
+	rm -f server dispatcher picture app
 	rm -f tests/01_system_benchmark/sys_bench tests/01_system_benchmark/benchmark_report.json
 	rm -f tests/02_matrix_simd/matrix_simd tests/02_matrix_simd/matrix_result.bin tests/02_matrix_simd/matrix_report.json
 	rm -f tests/03_kv_storage/kv_engine tests/03_kv_storage/wal.bin tests/03_kv_storage/kv_report.json

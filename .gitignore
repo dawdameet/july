@@ -4,6 +4,7 @@
 app
 server
 dispatcher
+picture
 .DS_Store
 
 # Test run artifacts
