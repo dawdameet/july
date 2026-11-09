@@ -51,4 +51,15 @@ concurrency under real compute load?
 > • multithreaded prime telemetry + kernel sandbox verification
 > pegged all Linux cores to 100%, ran 3 GCC compilers simultaneously in tmpfs, and streamed ~8.5 MB of binaries back to Mac in 3.2 seconds.
 
+what it means for me?
+> my laptop stays dead cool and silent. zero fan noise, zero battery drain from heavy GCC builds, tests, or background container daemons.
+> write code on ARM64 macOS, compile & test against native x86_64 Linux kernel primitives without running heavy virtual machines.
+> no SSH keys to manage, no rsync drift, no Dockerfiles to maintain. that idle box in the corner is now an invisible extension of my terminal.
+
+machine specs (for reproducible numbers)?
+> client (dispatcher): Apple MacBook (Apple M1, 8 GB RAM, macOS)
+> worker (remote node): Intel Core i3-1005G1 (2C/4T @ 1.20GHz, 3.40GHz boost), Fedora Linux 40 (x86_64, Kernel 6.8+), tmpfs RAM disk
+> network: consumer home Wi-Fi (LAN, 192.168.1.41:8080, ~2-3 ms baseline ping)
+> compiler: gcc (GCC) 14.x with -O3 -pthread -mavx2
+
 code: https://github.com/dawdameet/july
