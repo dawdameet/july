@@ -1,0 +1,36 @@
+{
+  "name": "linux-sandbox-and-rich-manifest",
+  "options": {
+    "timeout_sec": 30,
+    "kill_if_timeout": true
+  },
+  "env": {
+    "CUSTOM_BUILD_TAG": "v2.0-sandboxed",
+    "OPTIMIZATION": "-O3"
+  },
+  "sandbox": {
+    "network": false,
+    "memory_mb": 512,
+    "namespace": true
+  },
+  "pre_flight": {
+    "check_tools": ["gcc", "make"],
+    "deps": [
+      "echo 'Verifying isolated sandbox environment'"
+    ]
+  },
+  "build": [
+    "make -f Makefile clean",
+    "make -f Makefile",
+    "./sandbox_probe"
+  ],
+  "artifacts": {
+    "required": [
+      "sandbox_probe",
+      "sandbox_report.json"
+    ],
+    "on_failure": [
+      "fail.log"
+    ]
+  }
+}

@@ -73,9 +73,21 @@ test-pipeline: dispatcher
 	@cat tests/04_data_pipeline/analytics_summary.json
 	@echo "\n[✓] Data Pipeline Test Passed!"
 
-test-all: test-sysbench test-matrix test-kv test-pipeline
+test-sandbox: dispatcher
+	@echo "================================================================="
+	@echo " [5/5] Dispatching Rich Manifest & Sandbox Isolation Test"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/05_sandbox_rich && ../../dispatcher $(TARGET) workflow workflow.json Makefile src/main.c
+	@echo "\n[*] Artifact Check:"
+	@file tests/05_sandbox_rich/sandbox_probe
+	@echo "\n[*] Report:"
+	@cat tests/05_sandbox_rich/sandbox_report.json
+	@echo "\n[✓] Sandbox Isolation Test Passed!"
+
+test-all: test-sysbench test-matrix test-kv test-pipeline test-sandbox
 	@echo "\n================================================================="
-	@echo "       [✓] ALL 4 REMOTE LINUX APPLICATIONS PASSED!               "
+	@echo "       [✓] ALL 5 REMOTE LINUX APPLICATIONS PASSED!               "
 	@echo "================================================================="
 
 clean:

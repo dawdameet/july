@@ -385,14 +385,16 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
                 struct rlimit rl_mem;
                 rl_mem.rlim_cur = (rlim_t)manifest->sandbox_memory_mb * 1024ULL * 1024ULL;
                 rl_mem.rlim_max = rl_mem.rlim_cur;
-                setrlimit(RLIMIT_AS, &rl_mem);
+                setrlimit(RLIMIT_DATA, &rl_mem);
             }
 
-            int max_pids = manifest->sandbox_max_pids > 0 ? manifest->sandbox_max_pids : 128;
-            struct rlimit rl_proc;
-            rl_proc.rlim_cur = (rlim_t)max_pids;
-            rl_proc.rlim_max = (rlim_t)max_pids;
-            setrlimit(RLIMIT_NPROC, &rl_proc);
+            if (manifest->sandbox_max_pids > 0)
+            {
+                struct rlimit rl_proc;
+                rl_proc.rlim_cur = (rlim_t)manifest->sandbox_max_pids;
+                rl_proc.rlim_max = (rlim_t)manifest->sandbox_max_pids;
+                setrlimit(RLIMIT_NPROC, &rl_proc);
+            }
 
             if (timeout_sec > 0)
             {
@@ -643,10 +645,10 @@ int execute_workflow_task(const Task *task)
     dprintf(log_fd, "=== July Workflow: %s (Task ID: %s) ===\n", manifest.name, task->taskId);
     if (manifest.sandbox_memory_mb > 0 || manifest.sandbox_max_pids > 0 || manifest.sandbox_namespace || !manifest.sandbox_network)
     {
-        dprintf(log_fd, "[Sandbox] Config: net=%s, mem=%dMB, pids=%d, ns=%s\n",
+        dprintf(log_fd, "[Sandbox] Config: net=%s, mem=%dMB, pids=%s, ns=%s\n",
                 manifest.sandbox_network ? "host" : "loopback",
                 manifest.sandbox_memory_mb,
-                manifest.sandbox_max_pids > 0 ? manifest.sandbox_max_pids : 128,
+                manifest.sandbox_max_pids > 0 ? "limited" : "host-managed",
                 manifest.sandbox_namespace ? "enabled" : "disabled");
     }
     if (manifest.num_env_vars > 0)
