@@ -6,14 +6,15 @@ what is it?
 > turns any spare linux box on your LAN into ambient compute in milliseconds.
 
 how fast?
-> shipped a full C repo over Wi-Fi, compiled with gcc -O3, ran 4 threads, and downloaded the binary back in 580 ms total (orchestration overhead: ~80 ms).
+> shipped a full C repo over Wi-Fi, compiled with gcc -O3, ran 4 threads, and downloaded the binary back in 580 ms total.
+> latency budget: 2 ms RAM pack, 3 ms Wi-Fi transfer, 3 ms tmpfs unpack, 420 ms GCC compile, 51 ms CPU run, 10 ms sendfile() DMA return. orchestration overhead is ~80 ms.
 
 why not docker / ssh?
-> no container daemon, no layer caching delays, no ssh negotiation. 
-> packs files in RAM in 2 ms, sends raw memory-aligned envelope (0x4A554C59 header), unpacks straight into tmpfs (RAM disk).
+> no container daemon, no layer caching delays, no ssh negotiation (which takes 300-800 ms alone). 
+> packs files into RAM in 2 ms, sends raw memory-aligned envelope (0x4A554C59 header), unpacks straight into tmpfs (RAM disk).
 
 auth?
-> 0-RTT header check (X-July-Token). no token = instant 401 Unauthorized. neighbors can't mine crypto.
+> 0-RTT header check (X-July-Token). no token = instant 401 Unauthorized. neighbors on Wi-Fi cannot mine crypto.
 
 security?
 > linux kernel namespaces (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNET).
@@ -23,17 +24,31 @@ how tcp session not adding ms?
 > interactive ambient console (`july>`) holds a single warm TCP connection pool.
 > fire tasks with zero handshake delay. close laptop lid = clean disconnect.
 
-numbers on warm vs cold tcp?
-> warm tcp: 1,929 req/s | avg 9.5 ms | p99 21.6 ms
-> cold tcp:  833 req/s  | avg 23.8 ms | p99 304.7 ms
-> 2.32x faster throughput, 60% lower latency, 14x lower p99 tail (avoids TCP SYN overhead & TIME_WAIT socket exhaustion).
-> sustained 2,762 req/s with keep-alive under stress.
+numbers on warm vs cold tcp shootout?
+> 2,000 requests over Wi-Fi (20 concurrent threads):
+> • throughput: 1,929 req/s (warm) vs 833 req/s (cold) — 2.32x faster
+> • avg latency: 9.54 ms vs 23.81 ms — 60% lower
+> • p50 latency: 8.89 ms vs 18.90 ms — 53% lower
+> • p95 latency: 14.91 ms vs 34.57 ms — 57% lower
+> • p99 latency: 21.65 ms vs 304.71 ms — 14x better tail latency
+> cold connections get destroyed by TCP SYN queues and TIME_WAIT ephemeral socket exhaustion.
+
+what about sustained stress bombardment?
+> hammered with 50 concurrent connections over 10 seconds:
+> • 27,618 requests handled in 10s
+> • 2,762 req/s sustained throughput (peaking at 4,045 req/s)
+> • 100% 202 Accepted status codes
+> • 0 timeouts, 0 dropped sockets, 0 errors
 
 downloading compiled artifacts?
 > zero user-space copying. linux kernel `sendfile()` streams page cache straight into socket TX buffers via DMA.
 
-concurrency?
-> fired 5 distinct workloads in parallel (matrix multiplication, 16-shard KV store with 1.7M ops/sec, financial ticker pipeline, telemetry, sandbox tests).
-> compiled 3 GCC builds simultaneously and streamed ~8.5 MB back in 3.2 seconds.
+concurrency under real compute load?
+> fired 5 distinct workloads in parallel (make -j5):
+> • 16-shard in-memory key-value store logging 100k txns to binary WAL @ 1.72M ops/sec
+> • 512x512 block-tiled matrix multiplication @ 7.62 GFLOPS
+> • C tick generator + Python 3 stream analytics @ 1.27M ticks/sec (7.25 MB binary stream)
+> • multithreaded prime telemetry + kernel sandbox verification
+> pegged all Linux cores to 100%, ran 3 GCC compilers simultaneously in tmpfs, and streamed ~8.5 MB of binaries back to Mac in 3.2 seconds.
 
 code: https://github.com/dawdameet/july
