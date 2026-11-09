@@ -1,0 +1,16 @@
+*.bin
+*.profraw
+*.profdata
+app
+server
+dispatcher
+.DS_Store
+
+# Test run artifacts
+tests/**/sys_bench
+tests/**/matrix_simd
+tests/**/kv_engine
+tests/**/tick_gen
+tests/**/*.bin
+tests/**/*.json
+!tests/**/workflow.json

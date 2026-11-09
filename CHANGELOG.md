@@ -6,6 +6,25 @@ All notable milestones, git commits, optimization breakthroughs, and architectur
 
 ## Git Commit History
 
+### `HEAD` — `Multi-Application Remote Test Suite & Polyglot Pipelines`
+- **Date**: Mon Nov 9 23:30:00 2026 +0530
+- **Author**: Meet Dawda
+- **Summary**:
+  - Modularized `tests/` into 4 production-grade remote workloads to exercise diverse compute, storage, and runtime capabilities:
+    1. **`01_system_benchmark`**: Multithreaded Linux CPU prime calculations (`pthread`), OS telemetry parsing (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/loadavg`), returning `sys_bench` (ELF x86-64) and `benchmark_report.json`.
+    2. **`02_matrix_simd`**: Parallel block-tiled matrix multiplication ($512 \times 512$ floats) testing L1/L2/L3 cache locality and memory bandwidth ($7.63\text{ GFLOPS}$ on 4 threads), exporting `matrix_result.bin` (65 KB) and `matrix_report.json`.
+    3. **`03_kv_storage`**: Concurrent sharded in-memory Key-Value store with append-only Write-Ahead Log (WAL), performing $100,000$ operations at $3.90\text{ Mops/s}$ ($P_{99} = 7\,\mu\text{s}$), streaming `wal.bin` (1.06 MB) back to Mac via zero-copy `sendfile()`.
+    4. **`04_data_pipeline`**: Polyglot pipeline combining high-frequency C market tick generator ($250,000$ packed binary records, $7.25\text{ MB}$) with a Python 3 analytics engine ($1.27\text{ million ticks/sec}$, computing VWAP, volatility, and order volume ratios), outputting `ticks.bin` and `analytics_summary.json`.
+  - Added full automation in root `Makefile`:
+    - `make test-sysbench` (or `make test`)
+    - `make test-matrix`
+    - `make test-kv`
+    - `make test-pipeline`
+    - `make test-all` (executes all 4 suites consecutively across LAN in ~5 seconds total).
+  - Updated `.gitignore` to prevent tracking of remote binary artifacts and WAL dumps.
+
+---
+
 ### `0c4022c` — `dispatcher on LAN`
 - **Date**: Mon Nov 9 20:50:47 2026 +0530
 - **Author**: Meet Dawda

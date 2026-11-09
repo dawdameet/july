@@ -1,0 +1,25 @@
+{
+  "name": "linux-system-benchmark",
+  "options": {
+    "timeout_sec": 30,
+    "kill_if_timeout": true,
+    "from_github": false,
+    "github_link": ""
+  },
+  "pre_flight": {
+    "check_tools": ["gcc", "make"],
+    "deps": [
+      "echo 'Sandbox environment verified'"
+    ]
+  },
+  "build": [
+    "make -f Makefile clean",
+    "make -f Makefile",
+    "./sys_bench"
+  ],
+  "required_artifacts": [
+    "sys_bench",
+    "benchmark_report.json"
+  ]
+}
+

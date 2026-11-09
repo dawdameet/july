@@ -1,0 +1,25 @@
+{
+  "name": "concurrent-kv-wal-storage",
+  "options": {
+    "timeout_sec": 30,
+    "kill_if_timeout": true,
+    "from_github": false,
+    "github_link": ""
+  },
+  "pre_flight": {
+    "check_tools": ["gcc", "make"],
+    "deps": [
+      "echo 'Sandbox storage environment ready'"
+    ]
+  },
+  "build": [
+    "make -f Makefile clean",
+    "make -f Makefile",
+    "./kv_engine"
+  ],
+  "required_artifacts": [
+    "kv_engine",
+    "wal.bin",
+    "kv_report.json"
+  ]
+}

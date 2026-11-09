@@ -1,0 +1,25 @@
+{
+  "name": "hybrid-c-python-stream-pipeline",
+  "options": {
+    "timeout_sec": 30,
+    "kill_if_timeout": true,
+    "from_github": false,
+    "github_link": ""
+  },
+  "pre_flight": {
+    "check_tools": ["gcc", "make", "python3"],
+    "deps": [
+      "echo 'Verifying C compiler and Python3 runtime'"
+    ]
+  },
+  "build": [
+    "make -f Makefile clean",
+    "make -f Makefile",
+    "./tick_gen",
+    "python3 analyze.py"
+  ],
+  "required_artifacts": [
+    "ticks.bin",
+    "analytics_summary.json"
+  ]
+}

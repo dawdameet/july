@@ -1,0 +1,89 @@
+TARGET ?= 192.168.1.41:8080
+
+CC ?= clang
+SYSROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null)
+
+CFLAGS_SERVER = -Wall -Wextra -O3 -lpthread
+CFLAGS_DISPATCHER = -Wall -Wextra -O2
+
+ifneq ($(SYSROOT),)
+    CFLAGS_SERVER += -isysroot $(SYSROOT)
+    CFLAGS_DISPATCHER += -isysroot $(SYSROOT)
+endif
+
+all: dispatcher server
+
+dispatcher: dispatcher.c workflow.h task.h
+	$(CC) $(CFLAGS_DISPATCHER) -o dispatcher dispatcher.c
+
+server: server.c workflow.h task.h
+	$(CC) $(CFLAGS_SERVER) -o server server.c
+
+# ---------------- Application Tests ----------------
+
+test: test-sysbench
+
+test-sysbench: dispatcher
+	@echo "================================================================="
+	@echo " [1/4] Dispatching Linux System Telemetry & Prime Benchmark"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/01_system_benchmark && ../../dispatcher $(TARGET) workflow workflow.json Makefile src/main.c
+	@echo "\n[*] Artifact Check:"
+	@file tests/01_system_benchmark/sys_bench
+	@echo "\n[*] Report:"
+	@cat tests/01_system_benchmark/benchmark_report.json
+	@echo "\n[✓] System Benchmark Passed!"
+
+test-matrix: dispatcher
+	@echo "================================================================="
+	@echo " [2/4] Dispatching Matrix SIMD & Memory Cache Locality Test"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/02_matrix_simd && ../../dispatcher $(TARGET) workflow workflow.json Makefile src/main.c
+	@echo "\n[*] Artifact Check:"
+	@file tests/02_matrix_simd/matrix_simd
+	@file tests/02_matrix_simd/matrix_result.bin
+	@echo "\n[*] Report:"
+	@cat tests/02_matrix_simd/matrix_report.json
+	@echo "\n[✓] Matrix SIMD Test Passed!"
+
+test-kv: dispatcher
+	@echo "================================================================="
+	@echo " [3/4] Dispatching Concurrent In-Memory Key-Value & WAL Engine"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/03_kv_storage && ../../dispatcher $(TARGET) workflow workflow.json Makefile src/main.c
+	@echo "\n[*] Artifact Check:"
+	@file tests/03_kv_storage/kv_engine
+	@ls -lh tests/03_kv_storage/wal.bin
+	@echo "\n[*] Report:"
+	@cat tests/03_kv_storage/kv_report.json
+	@echo "\n[✓] Key-Value Storage Test Passed!"
+
+test-pipeline: dispatcher
+	@echo "================================================================="
+	@echo " [4/4] Dispatching Hybrid C Generator + Python Stream Analytics"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/04_data_pipeline && ../../dispatcher $(TARGET) workflow workflow.json Makefile analyze.py src/main.c
+	@echo "\n[*] Artifact Check:"
+	@ls -lh tests/04_data_pipeline/ticks.bin
+	@echo "\n[*] Report:"
+	@cat tests/04_data_pipeline/analytics_summary.json
+	@echo "\n[✓] Data Pipeline Test Passed!"
+
+test-all: test-sysbench test-matrix test-kv test-pipeline
+	@echo "\n================================================================="
+	@echo "       [✓] ALL 4 REMOTE LINUX APPLICATIONS PASSED!               "
+	@echo "================================================================="
+
+clean:
+	rm -f server dispatcher app
+	rm -f tests/01_system_benchmark/sys_bench tests/01_system_benchmark/benchmark_report.json
+	rm -f tests/02_matrix_simd/matrix_simd tests/02_matrix_simd/matrix_result.bin tests/02_matrix_simd/matrix_report.json
+	rm -f tests/03_kv_storage/kv_engine tests/03_kv_storage/wal.bin tests/03_kv_storage/kv_report.json
+	rm -f tests/04_data_pipeline/tick_gen tests/04_data_pipeline/ticks.bin tests/04_data_pipeline/analytics_summary.json
+	rm -f tests/sys_bench tests/benchmark_report.json
+
+.PHONY: all test test-sysbench test-matrix test-kv test-pipeline test-all clean

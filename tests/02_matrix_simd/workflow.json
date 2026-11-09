@@ -1,0 +1,25 @@
+{
+  "name": "matrix-simd-cache-benchmark",
+  "options": {
+    "timeout_sec": 30,
+    "kill_if_timeout": true,
+    "from_github": false,
+    "github_link": ""
+  },
+  "pre_flight": {
+    "check_tools": ["gcc", "make"],
+    "deps": [
+      "echo 'Verifying compiler and threading runtime'"
+    ]
+  },
+  "build": [
+    "make -f Makefile clean",
+    "make -f Makefile",
+    "./matrix_simd 512"
+  ],
+  "required_artifacts": [
+    "matrix_simd",
+    "matrix_result.bin",
+    "matrix_report.json"
+  ]
+}
