@@ -1,42 +1,39 @@
-update on July: moved it from localhost theory onto physical hardware across my LAN.
+update on July (distributed C execution engine across LAN).
 
-MacBook on my desk, idle box running Fedora Linux in the corner.
+the devlog was getting too long, so here’s the tl;dr in Q&A:
 
-at first I was just firing raw shell strings over TCP, but that got boring fast. if I’m offloading builds, I don’t want to mess with SSH keys, docker daemon overhead, or rsync sync lag. I wanted to ship an entire repo snapshot, compile it remotely, stream live logs, and pull the compiled binary back to my Mac.
+what is it?
+> turns any spare linux box on your LAN into ambient compute in milliseconds.
 
-so I wrote a custom container engine into July. 
-no tar, no gzip, no docker. 
+how fast?
+> shipped a full C repo over Wi-Fi, compiled with gcc -O3, ran 4 threads, and downloaded the binary back in 580 ms total (orchestration overhead: ~80 ms).
 
-just a memory-aligned binary envelope with a 0x4A554C59 ("JULY") header + JSON manifest. 
-main machine packs files into RAM in 2 ms, ships them over a raw TCP socket, and the Linux worker unpacks straight into tmpfs (RAM disk). 
+why not docker / ssh?
+> no container daemon, no layer caching delays, no ssh negotiation. 
+> packs files in RAM in 2 ms, sends raw memory-aligned envelope (0x4A554C59 header), unpacks straight into tmpfs (RAM disk).
 
-to get files back without burning CPU, I hooked the artifact downloads up to Linux’s `sendfile()`. the kernel pulls directly from the OS page cache into socket TX buffers via DMA. zero user-space copying.
+auth?
+> 0-RTT header check (X-July-Token). no token = instant 401 Unauthorized. neighbors can't mine crypto.
 
-first real test: shipped a multithreaded C benchmark from Mac to Linux, compiled with gcc -O3, ran 4 threads, streamed stdout live, and downloaded the ELF executable + JSON report back to my Mac.
+security?
+> linux kernel namespaces (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNET).
+> offline loopback mode by default (builds cannot phone home or scan LAN) + memory ceiling via RLIMIT_DATA.
 
-total wall time over Wi-Fi: 0.580s.
-~470 ms of that was just GCC compiling and the CPU running. the entire July orchestration + network overhead was ~80 ms. Docker takes 4–5 seconds just to negotiate layers and namespaces for the same job.
+how tcp session not adding ms?
+> interactive ambient console (`july>`) holds a single warm TCP connection pool.
+> fire tasks with zero handshake delay. close laptop lid = clean disconnect.
 
-then I saturated the worker and fired 5 completely different workloads simultaneously (make -j5):
-1. linux system telemetry + prime benchmark
-2. 512x512 block-tiled matrix multiplication (7.6 GFLOPS)
-3. 16-shard in-memory key-value store logging 100k txns to a binary WAL (1.7M ops/sec under load)
-4. a hybrid pipeline: C generates 250k binary financial ticks (7.25 MB) and Python 3 crunches VWAP & volatility at 1.2M ticks/sec
-5. a kernel sandbox test verifying memory limits and network isolation
+numbers on warm vs cold tcp?
+> warm tcp: 1,929 req/s | avg 9.5 ms | p99 21.6 ms
+> cold tcp:  833 req/s  | avg 23.8 ms | p99 304.7 ms
+> 2.32x faster throughput, 60% lower latency, 14x lower p99 tail (avoids TCP SYN overhead & TIME_WAIT socket exhaustion).
+> sustained 2,762 req/s with keep-alive under stress.
 
-the Linux box pegged all cores to 100%. three GCC compilers running simultaneously in isolated sandboxes. all 5 finished, and streamed ~8.5 MB of binaries and datasets back to my Mac in ~3.2 seconds over Wi-Fi.
+downloading compiled artifacts?
+> zero user-space copying. linux kernel `sendfile()` streams page cache straight into socket TX buffers via DMA.
 
-then I tackled production hardening:
-- auth: added token authentication (--token or JULY_TOKEN) with 0-RTT HTTP header checks. if your neighbor on Wi-Fi hits port 8080 without a key, they get an instant 401.
-- worker sandboxing: Linux kernel namespaces (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID) and memory limits (setrlimit RLIMIT_DATA). by default builds run in an isolated network namespace (CLONE_NEWNET) with loopback only—untrusted builds literally cannot phone home or scan your LAN.
-- richer manifests: custom environment variable injection (env) and failure artifact collection (on_failure) so crash logs still get staged if a build fails.
-- interactive console: instead of a clunky background daemon that freezes when your laptop sleeps, ./dispatcher drops you into an ambient console (july>). it holds a warm TCP pipe open while you hack, lets you fire workflows or commands with zero handshake delay, and cleanly disconnects when you close your laptop lid.
-
-finally, ran a stress shootout comparing Warm TCP (reused sockets) vs Cold TCP (fresh 3-way handshake per request):
-- Warm TCP: 1,929 req/s | avg latency 9.5 ms | p99 21.6 ms
-- Cold TCP:  833 req/s   | avg latency 23.8 ms | p99 304.7 ms
-➔ 2.32x faster throughput, 60% lower latency, and 14x better tail latency (cold connections get massacred by TCP SYN queues and TIME_WAIT socket churn). With autocannon keep-alive, it sustained 2,762 req/s (peak 4,045 req/s) with 27k requests in 10s and zero errors.
-
-turns out you don’t need heavyweight container runtimes or Kubernetes on your home network. raw sockets, tmpfs, and sendfile() turn any spare machine into ambient compute in milliseconds.
+concurrency?
+> fired 5 distinct workloads in parallel (matrix multiplication, 16-shard KV store with 1.7M ops/sec, financial ticker pipeline, telemetry, sandbox tests).
+> compiled 3 GCC builds simultaneously and streamed ~8.5 MB back in 3.2 seconds.
 
 code: https://github.com/dawdameet/july
