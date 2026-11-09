@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <stdint.h>
 #include <netinet/in.h>
@@ -23,12 +24,15 @@
 #include <sys/event.h>
 #else
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #endif
 
 #include "task.h"
+#include "workflow.h"
 
 #define PORT 8080
-#define BUFFER_SIZE 2048
+#define INITIAL_BUFFER_SIZE 8192
+#define MAX_PAYLOAD_SIZE (64 * 1024 * 1024) // 64 MB max envelope
 #define OUTPUT_BUFFER_SIZE 8192
 #define MAX_QUEUE 65536
 #define NUM_WORKERS 4
@@ -55,6 +59,7 @@ typedef struct TaskResult {
     char taskId[MAX_TASK_ID];
     TaskStatus status;
     int exit_code;
+    int artifacts_count;
     size_t output_len;
     char output[MAX_TASK_OUTPUT];
     int next; // index within this stripe's entries
@@ -107,6 +112,7 @@ static void task_result_record_enqueued(const char *task_id)
         {
             st->entries[idx].status = TASK_STATUS_QUEUED;
             st->entries[idx].exit_code = 0;
+            st->entries[idx].artifacts_count = 0;
             st->entries[idx].output_len = 0;
             st->entries[idx].output[0] = '\0';
             pthread_mutex_unlock(&st->lock);
@@ -141,6 +147,7 @@ static void task_result_record_enqueued(const char *task_id)
     st->entries[idx].taskId[id_len] = '\0';
     st->entries[idx].status = TASK_STATUS_QUEUED;
     st->entries[idx].exit_code = 0;
+    st->entries[idx].artifacts_count = 0;
     st->entries[idx].output_len = 0;
     st->entries[idx].output[0] = '\0';
     st->entries[idx].next = st->buckets[b];
@@ -169,7 +176,8 @@ static void task_result_record_running(const char *task_id)
     pthread_mutex_unlock(&st->lock);
 }
 
-static void task_result_record_completed(const char *task_id, int exit_code, const char *output, size_t out_len)
+static void task_result_record_completed_full(const char *task_id, int exit_code, int artifacts_count,
+                                             const char *output, size_t out_len)
 {
     unsigned int h = hash_task_id(task_id);
     ResultStripe *st = &g_stripes[h % NUM_STRIPES];
@@ -183,6 +191,7 @@ static void task_result_record_completed(const char *task_id, int exit_code, con
         {
             st->entries[idx].status = TASK_STATUS_COMPLETED;
             st->entries[idx].exit_code = exit_code;
+            st->entries[idx].artifacts_count = artifacts_count;
             if (out_len >= MAX_TASK_OUTPUT)
                 out_len = MAX_TASK_OUTPUT - 1;
             memcpy(st->entries[idx].output, output, out_len);
@@ -193,7 +202,7 @@ static void task_result_record_completed(const char *task_id, int exit_code, con
         idx = st->entries[idx].next;
     }
 
-    if (idx == -1) // If not present, insert as completed directly
+    if (idx == -1)
     {
         idx = st->cursor;
         st->cursor = (st->cursor + 1) % ENTRIES_PER_STRIPE;
@@ -221,6 +230,7 @@ static void task_result_record_completed(const char *task_id, int exit_code, con
         st->entries[idx].taskId[id_len] = '\0';
         st->entries[idx].status = TASK_STATUS_COMPLETED;
         st->entries[idx].exit_code = exit_code;
+        st->entries[idx].artifacts_count = artifacts_count;
         if (out_len >= MAX_TASK_OUTPUT)
             out_len = MAX_TASK_OUTPUT - 1;
         memcpy(st->entries[idx].output, output, out_len);
@@ -233,7 +243,13 @@ static void task_result_record_completed(const char *task_id, int exit_code, con
     pthread_mutex_unlock(&st->lock);
 }
 
-static int task_result_get(const char *task_id, TaskStatus *status, int *exit_code,
+static inline void task_result_record_completed(const char *task_id, int exit_code,
+                                                const char *output, size_t out_len)
+{
+    task_result_record_completed_full(task_id, exit_code, 0, output, out_len);
+}
+
+static int task_result_get(const char *task_id, TaskStatus *status, int *exit_code, int *artifacts_count,
                            char *out_buf, size_t *out_len, size_t max_out)
 {
     unsigned int h = hash_task_id(task_id);
@@ -248,6 +264,8 @@ static int task_result_get(const char *task_id, TaskStatus *status, int *exit_co
         {
             *status = st->entries[idx].status;
             *exit_code = st->entries[idx].exit_code;
+            if (artifacts_count)
+                *artifacts_count = st->entries[idx].artifacts_count;
             size_t len = st->entries[idx].output_len;
             if (len >= max_out)
                 len = max_out - 1;
@@ -263,7 +281,401 @@ static int task_result_get(const char *task_id, TaskStatus *status, int *exit_co
     return -1;
 }
 
-/* ---------------- Task Execution & Worker Pool ---------------- */
+/* ---------------- Process Group & Command Execution in Sandbox ---------------- */
+
+static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
+                                  int log_fd, int timeout_sec, bool kill_if_timeout)
+{
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+        return -1;
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) // Child
+    {
+        // 1. Process Group Isolation (so kill(-pgid) hits entire tree)
+        setpgid(0, 0);
+
+        // 2. Redirect stdout & stderr
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        // 3. Set Working Directory to Sandbox
+        if (chdir(sandbox_dir) != 0)
+        {
+            perror("chdir to sandbox");
+            exit(127);
+        }
+
+        // 4. Execute
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        perror("execl /bin/sh");
+        exit(127);
+    }
+
+    // Parent
+    close(pipefd[1]);
+
+    int fl = fcntl(pipefd[0], F_GETFL, 0);
+    fcntl(pipefd[0], F_SETFL, fl | O_NONBLOCK);
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int status = 0;
+    bool timed_out = false;
+    char read_buf[4096];
+
+    while (1)
+    {
+        while (1)
+        {
+            ssize_t n = read(pipefd[0], read_buf, sizeof(read_buf));
+            if (n > 0)
+            {
+                write(log_fd, read_buf, (size_t)n);
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res == pid)
+        {
+            break;
+        }
+        else if (res < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double)(now.tv_sec - start.tv_sec) +
+                         (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+        if (timeout_sec > 0 && elapsed >= timeout_sec)
+        {
+            timed_out = true;
+            if (kill_if_timeout)
+            {
+                // Kill entire process tree
+                kill(-pid, SIGKILL);
+            }
+            else
+            {
+                kill(pid, SIGTERM);
+            }
+            waitpid(pid, &status, 0);
+            dprintf(log_fd, "\n[Timeout] Command exceeded timeout of %d seconds. Process group killed.\n", timeout_sec);
+            break;
+        }
+
+        usleep(10000); // 10ms sleep
+    }
+
+    // Final drain of any remaining pipe output
+    while (1)
+    {
+        ssize_t n = read(pipefd[0], read_buf, sizeof(read_buf));
+        if (n > 0)
+        {
+            write(log_fd, read_buf, (size_t)n);
+        }
+        else
+        {
+            break;
+        }
+    }
+    close(pipefd[0]);
+
+    if (timed_out)
+        return 124;
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY);
+    if (in < 0)
+        return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0)
+    {
+        close(in);
+        return -1;
+    }
+
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0)
+    {
+        if (write(out, buf, (size_t)n) != n)
+        {
+            close(in);
+            close(out);
+            return -1;
+        }
+    }
+    close(in);
+    close(out);
+    return 0;
+}
+
+/* Zero-copy kernel sendfile streaming */
+static void send_file_zero_copy(int sock_fd, int file_fd, size_t file_size)
+{
+#if defined(__APPLE__)
+    off_t len = (off_t)file_size;
+    sendfile(file_fd, sock_fd, 0, &len, NULL, 0);
+#else
+    off_t offset = 0;
+    size_t remaining = file_size;
+    while (remaining > 0)
+    {
+        ssize_t sent = sendfile(sock_fd, file_fd, &offset, remaining);
+        if (sent <= 0)
+        {
+            if (sent < 0 && (errno == EAGAIN || errno == EINTR))
+                continue;
+            break;
+        }
+        remaining -= (size_t)sent;
+    }
+#endif
+}
+
+/* ---------------- Workflow Pipeline Execution ---------------- */
+
+int execute_workflow_task(const Task *task)
+{
+    char storage_dir[512];
+    snprintf(storage_dir, sizeof(storage_dir), "/tmp/july_storage/%s", task->taskId);
+
+    char sandbox_dir[512];
+    snprintf(sandbox_dir, sizeof(sandbox_dir), "/tmp/july_runs/%s", task->taskId);
+
+    char artifacts_dir[512];
+    snprintf(artifacts_dir, sizeof(artifacts_dir), "/tmp/july_storage/%s/artifacts", task->taskId);
+
+    char log_path[512];
+    snprintf(log_path, sizeof(log_path), "/tmp/july_storage/%s/stdout.log", task->taskId);
+
+    char meta_path[512];
+    snprintf(meta_path, sizeof(meta_path), "/tmp/july_storage/%s/meta.json", task->taskId);
+
+    char envelope_path[512];
+    snprintf(envelope_path, sizeof(envelope_path), "/tmp/july_storage/%s/envelope.bin", task->taskId);
+
+    mkdir_p(storage_dir);
+    mkdir_p(sandbox_dir);
+    mkdir_p(artifacts_dir);
+
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd < 0)
+        return -1;
+
+    // Read envelope from WAL
+    int ef = open(envelope_path, O_RDONLY);
+    if (ef < 0)
+    {
+        dprintf(log_fd, "[Error] Could not open envelope.bin\n");
+        close(log_fd);
+        task_result_record_completed_full(task->taskId, 1, 0, "Envelope missing\n", 17);
+        return -1;
+    }
+
+    struct stat est;
+    if (fstat(ef, &est) < 0 || est.st_size < 16)
+    {
+        dprintf(log_fd, "[Error] Invalid envelope.bin size\n");
+        close(ef);
+        close(log_fd);
+        task_result_record_completed_full(task->taskId, 1, 0, "Invalid envelope\n", 17);
+        return -1;
+    }
+
+    uint8_t *env_data = malloc((size_t)est.st_size);
+    if (!env_data)
+    {
+        close(ef);
+        close(log_fd);
+        return -1;
+    }
+    ssize_t r = read(ef, env_data, (size_t)est.st_size);
+    close(ef);
+    if (r != est.st_size)
+    {
+        free(env_data);
+        close(log_fd);
+        return -1;
+    }
+
+    // Unpack directly into sandbox without tar subprocesses
+    WorkflowManifest manifest;
+    if (unpack_envelope(env_data, (size_t)est.st_size, sandbox_dir, &manifest) != 0)
+    {
+        dprintf(log_fd, "[Error] Failed to unpack binary envelope or parse JSON manifest\n");
+        free(env_data);
+        close(log_fd);
+        task_result_record_completed_full(task->taskId, 1, 0, "Unpack error\n", 13);
+        return -1;
+    }
+    free(env_data);
+
+    dprintf(log_fd, "=== July Workflow: %s (Task ID: %s) ===\n", manifest.name, task->taskId);
+
+    int exit_code = 0;
+
+    // Phase 1: Pre-flight tool check
+    for (int i = 0; i < manifest.num_check_tools; i++)
+    {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "command -v %s >/dev/null 2>&1", manifest.check_tools[i]);
+        int status = system(cmd);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        {
+            dprintf(log_fd, "[Pre-flight] Tool '%s': OK\n", manifest.check_tools[i]);
+        }
+        else
+        {
+            dprintf(log_fd, "[Pre-flight] Tool check failed: '%s' not found on host.\n", manifest.check_tools[i]);
+            exit_code = 127;
+            goto finish_workflow;
+        }
+    }
+
+    // Phase 2: Dependencies
+    if (manifest.from_github && manifest.github_link[0] != '\0')
+    {
+        dprintf(log_fd, "[Deps] Cloning from GitHub: %s\n", manifest.github_link);
+        char git_cmd[1024];
+        snprintf(git_cmd, sizeof(git_cmd), "git clone --depth 1 %s .", manifest.github_link);
+        int rc = run_command_in_sandbox(git_cmd, sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        if (rc != 0)
+        {
+            dprintf(log_fd, "[Deps] Git clone failed with exit code %d\n", rc);
+            exit_code = rc;
+            goto finish_workflow;
+        }
+    }
+
+    for (int i = 0; i < manifest.num_deps; i++)
+    {
+        dprintf(log_fd, "[Deps] Executing: %s\n", manifest.deps[i]);
+        int rc = run_command_in_sandbox(manifest.deps[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        if (rc != 0)
+        {
+            dprintf(log_fd, "[Deps] Dependency failed with exit code %d\n", rc);
+            exit_code = rc;
+            goto finish_workflow;
+        }
+    }
+
+    // Phase 3: Build & Execution pipeline
+    for (int i = 0; i < manifest.num_build_cmds; i++)
+    {
+        dprintf(log_fd, "[Build] Executing: %s\n", manifest.build_cmds[i]);
+        int rc = run_command_in_sandbox(manifest.build_cmds[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout);
+        if (rc != 0)
+        {
+            dprintf(log_fd, "[Build] Command failed with exit code %d\n", rc);
+            exit_code = rc;
+            goto finish_workflow;
+        }
+    }
+
+finish_workflow:
+    ;
+    // Phase 4: Artifact staging
+    int staged_count = 0;
+    if (exit_code == 0)
+    {
+        for (int i = 0; i < manifest.num_required_artifacts; i++)
+        {
+            const char *art = manifest.required_artifacts[i];
+            char src_path[1024], dst_path[1024];
+            snprintf(src_path, sizeof(src_path), "%s/%s", sandbox_dir, art);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", artifacts_dir, art);
+
+            mkdir_p_parent(dst_path);
+            if (rename(src_path, dst_path) == 0 || copy_file(src_path, dst_path) == 0)
+            {
+                struct stat ast;
+                stat(dst_path, &ast);
+                dprintf(log_fd, "[Artifacts] Staged '%s' (%ld bytes)\n", art, (long)ast.st_size);
+                staged_count++;
+            }
+            else
+            {
+                dprintf(log_fd, "[Artifacts] Warning: Required artifact '%s' could not be found or staged.\n", art);
+            }
+        }
+    }
+
+    dprintf(log_fd, "\n=== Workflow Finished (Exit Code: %d, Staged Artifacts: %d) ===\n", exit_code, staged_count);
+    close(log_fd);
+
+    // Phase 5: Write metadata (meta.json)
+    FILE *mf = fopen(meta_path, "w");
+    if (mf)
+    {
+        fprintf(mf, "{\n");
+        fprintf(mf, "  \"taskId\": \"%s\",\n", task->taskId);
+        fprintf(mf, "  \"name\": \"%s\",\n", manifest.name);
+        fprintf(mf, "  \"status\": \"%s\",\n", exit_code == 0 ? "Completed" : "Failed");
+        fprintf(mf, "  \"exit_code\": %d,\n", exit_code);
+        fprintf(mf, "  \"artifacts_count\": %d,\n", staged_count);
+        fprintf(mf, "  \"artifacts\": [");
+        for (int i = 0; i < manifest.num_required_artifacts; i++)
+        {
+            fprintf(mf, "\"%s\"%s", manifest.required_artifacts[i],
+                    (i + 1 < manifest.num_required_artifacts) ? ", " : "");
+        }
+        fprintf(mf, "]\n");
+        fprintf(mf, "}\n");
+        fclose(mf);
+    }
+
+    // Phase 6: Clean up ephemeral sandbox directory
+    char rm_cmd[1024];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", sandbox_dir);
+    if (system(rm_cmd) != 0) {
+        // Log cleanup warning if needed
+    }
+
+    // Read log snippet into TaskResultStore
+    char log_snippet[MAX_TASK_OUTPUT] = {0};
+    size_t snippet_len = 0;
+    int rf = open(log_path, O_RDONLY);
+    if (rf >= 0)
+    {
+        ssize_t n = read(rf, log_snippet, sizeof(log_snippet) - 1);
+        if (n > 0)
+        {
+            snippet_len = (size_t)n;
+            log_snippet[snippet_len] = '\0';
+        }
+        close(rf);
+    }
+
+    task_result_record_completed_full(task->taskId, exit_code, staged_count, log_snippet, snippet_len);
+    return exit_code;
+}
+
+/* ---------------- Legacy Task Execution & Worker Pool ---------------- */
 
 int execute_task(const Task *task, char *out_buf, size_t out_buf_size, size_t *out_len)
 {
@@ -382,9 +794,16 @@ void *worker_thread(void *arg)
         for (int i = 0; i < batch_size; i++)
         {
             Task *t = &batch[i];
+
+            if (t->type == TASK_TYPE_WORKFLOW)
+            {
+                task_result_record_running(t->taskId);
+                execute_workflow_task(t);
+                continue;
+            }
+
             if (likely(t->taskCommand[0] == ':' && t->taskCommand[1] == '\0'))
             {
-                // Fast path for ":" was already recorded on enqueue, no-op execution
                 continue;
             }
 
@@ -405,6 +824,7 @@ int parse_task(const char *body, size_t body_len, Task *task)
     if (unlikely(body_len < sizeof(TaskHeader)))
         return -1;
 
+    task->type = TASK_TYPE_COMMAND;
     memcpy(&task->header, body, sizeof(TaskHeader));
     uint32_t id_len = task->header.taskIdLen;
     uint32_t command_len = task->header.taskCommandLen;
@@ -430,7 +850,8 @@ int parse_task(const char *body, size_t body_len, Task *task)
 typedef struct Connection
 {
     int fd;
-    char input[BUFFER_SIZE];
+    char *input;
+    size_t input_cap;
     size_t input_len;
     char output[OUTPUT_BUFFER_SIZE];
     size_t output_len;
@@ -523,6 +944,8 @@ static inline void close_connection(int kq, Connection *conn)
     if (!conn)
         return;
     close(conn->fd);
+    if (conn->input)
+        free(conn->input);
     free(conn);
 }
 #else
@@ -540,6 +963,8 @@ static inline void close_connection(int epfd, Connection *conn)
         return;
     epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
     close(conn->fd);
+    if (conn->input)
+        free(conn->input);
     free(conn);
 }
 #endif
@@ -549,7 +974,7 @@ static inline ssize_t complete_request_size(Connection *conn)
     conn->input[conn->input_len] = '\0';
     char *header_end = strstr(conn->input, "\r\n\r\n");
     if (!header_end)
-        return conn->input_len >= BUFFER_SIZE - 1 ? -1 : 0;
+        return 0;
 
     size_t header_bytes = (size_t)(header_end + 4 - conn->input);
     size_t content_len = 0;
@@ -564,8 +989,19 @@ static inline ssize_t complete_request_size(Connection *conn)
     }
 
     size_t total = header_bytes + content_len;
-    if (unlikely(total >= BUFFER_SIZE))
+    if (unlikely(total > MAX_PAYLOAD_SIZE))
         return -1;
+
+    // Expand buffer if needed to accept full request
+    if (conn->input_cap < total + 1024)
+    {
+        size_t new_cap = total + 1024;
+        char *nb = realloc(conn->input, new_cap);
+        if (!nb)
+            return -1;
+        conn->input = nb;
+        conn->input_cap = new_cap;
+    }
 
     if (conn->input_len >= total)
     {
@@ -635,7 +1071,7 @@ static bool extract_retrieve_id(const char *req, size_t req_len, char *task_id_o
     p += 9;
     if (*p == '/')
     {
-        p++; // skip '/'
+        p++;
         size_t i = 0;
         while (*p && *p != ' ' && *p != '?' && *p != '\r' && *p != '\n' && i < max_id_len - 1)
         {
@@ -646,7 +1082,7 @@ static bool extract_retrieve_id(const char *req, size_t req_len, char *task_id_o
     }
     else if (*p == '?')
     {
-        p++; // skip '?'
+        p++;
         const char *line_end = strchr(p, '\r');
         if (!line_end)
             line_end = strchr(p, ' ');
@@ -704,6 +1140,70 @@ static int prepare_response(Connection *conn, size_t request_len)
         {
             write_response(conn, response_200, response_200_len);
         }
+        else if (strncmp(conn->input + 4, "/retrieve/", 10) == 0 && strstr(conn->input + 14, "/artifact/"))
+        {
+            // Zero-copy artifact download endpoint: GET /retrieve/<taskId>/artifact/<filename>
+            const char *id_start = conn->input + 14;
+            const char *art_marker = strstr(id_start, "/artifact/");
+            size_t id_len = (size_t)(art_marker - id_start);
+            char task_id[MAX_TASK_ID] = {0};
+            if (id_len >= sizeof(task_id))
+                id_len = sizeof(task_id) - 1;
+            memcpy(task_id, id_start, id_len);
+            task_id[id_len] = '\0';
+
+            const char *fn_start = art_marker + 10;
+            const char *fn_end = fn_start;
+            while (*fn_end && *fn_end != ' ' && *fn_end != '?' && *fn_end != '\r' && *fn_end != '\n')
+                fn_end++;
+            size_t fn_len = (size_t)(fn_end - fn_start);
+            char filename[256] = {0};
+            if (fn_len >= sizeof(filename))
+                fn_len = sizeof(filename) - 1;
+            memcpy(filename, fn_start, fn_len);
+            filename[fn_len] = '\0';
+
+            if (filename[0] == '/' || strstr(filename, "..") || filename[0] == '\0')
+            {
+                write_response(conn, response_400, response_400_len);
+            }
+            else
+            {
+                char art_path[512];
+                snprintf(art_path, sizeof(art_path), "/tmp/july_storage/%s/artifacts/%s", task_id, filename);
+                int art_fd = open(art_path, O_RDONLY);
+                if (art_fd < 0)
+                {
+                    write_response(conn, response_retrieve_404, response_retrieve_404_len);
+                }
+                else
+                {
+                    struct stat st;
+                    fstat(art_fd, &st);
+                    char hdr[512];
+                    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        (size_t)st.st_size, filename);
+
+#if defined(MSG_NOSIGNAL)
+                    send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
+#else
+                    send(conn->fd, hdr, hlen, 0);
+#endif
+                    send_file_zero_copy(conn->fd, art_fd, (size_t)st.st_size);
+                    close(art_fd);
+                    conn->close_after_write = true;
+                    conn->output_len = 0;
+                    conn->output_offset = 0;
+                    return 1; // Streamed directly
+                }
+            }
+        }
         else if (strncmp(conn->input + 4, "/retrieve", 9) == 0)
         {
             char task_id[MAX_TASK_ID] = {0};
@@ -713,12 +1213,73 @@ static int prepare_response(Connection *conn, size_t request_len)
             }
             else
             {
+                char storage_log[512], storage_meta[512];
+                snprintf(storage_log, sizeof(storage_log), "/tmp/july_storage/%s/stdout.log", task_id);
+                snprintf(storage_meta, sizeof(storage_meta), "/tmp/july_storage/%s/meta.json", task_id);
+
+                struct stat meta_st;
+                if (stat(storage_meta, &meta_st) == 0)
+                {
+                    // Workflow task completed: parse meta.json for exit_code and artifacts_count
+                    int exit_code = 0;
+                    int art_count = 0;
+                    FILE *mf = fopen(storage_meta, "r");
+                    if (mf)
+                    {
+                        char mline[256];
+                        while (fgets(mline, sizeof(mline), mf))
+                        {
+                            if (strstr(mline, "\"exit_code\":"))
+                            {
+                                sscanf(strstr(mline, "\"exit_code\":") + 12, "%d", &exit_code);
+                            }
+                            if (strstr(mline, "\"artifacts_count\":"))
+                            {
+                                sscanf(strstr(mline, "\"artifacts_count\":") + 18, "%d", &art_count);
+                            }
+                        }
+                        fclose(mf);
+                    }
+
+                    int log_fd = open(storage_log, O_RDONLY);
+                    if (log_fd >= 0)
+                    {
+                        struct stat log_st;
+                        fstat(log_fd, &log_st);
+                        char hdr[512];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: Completed\r\n"
+                            "X-Task-Exit-Code: %d\r\n"
+                            "X-Artifacts-Count: %d\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: close\r\n"
+                            "\r\n",
+                            exit_code, art_count, (size_t)log_st.st_size);
+
+#if defined(MSG_NOSIGNAL)
+                        send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
+#else
+                        send(conn->fd, hdr, hlen, 0);
+#endif
+                        send_file_zero_copy(conn->fd, log_fd, (size_t)log_st.st_size);
+                        close(log_fd);
+                        conn->close_after_write = true;
+                        conn->output_len = 0;
+                        conn->output_offset = 0;
+                        return 1;
+                    }
+                }
+
+                // Check in-memory result store (either running or legacy task)
                 TaskStatus status = 0;
                 int exit_code = 0;
+                int art_count = 0;
                 char task_out[MAX_TASK_OUTPUT];
                 size_t task_out_len = 0;
 
-                if (task_result_get(task_id, &status, &exit_code, task_out, &task_out_len, sizeof(task_out)) != 0)
+                if (task_result_get(task_id, &status, &exit_code, &art_count, task_out, &task_out_len, sizeof(task_out)) != 0)
                 {
                     write_response(conn, response_retrieve_404, response_retrieve_404_len);
                 }
@@ -734,9 +1295,10 @@ static int prepare_response(Connection *conn, size_t request_len)
                         "Content-Type: text/plain\r\n"
                         "X-Task-Status: Completed\r\n"
                         "X-Task-Exit-Code: %d\r\n"
+                        "X-Artifacts-Count: %d\r\n"
                         "Content-Length: %zu\r\n"
                         "\r\n",
-                        exit_code, task_out_len);
+                        exit_code, art_count, task_out_len);
                     write_dynamic_response(conn, hdr, (size_t)hlen, task_out, task_out_len);
                 }
             }
@@ -744,6 +1306,65 @@ static int prepare_response(Connection *conn, size_t request_len)
         else
         {
             write_response(conn, response_404, response_404_len);
+        }
+    }
+    else if (conn->input[0] == 'P' && strncmp(conn->input, "POST /workflow ", 15) == 0)
+    {
+        // Binary multi-file envelope workflow submission
+        const char *body = conn->input + conn->header_bytes;
+        size_t declared_len = conn->content_len;
+        size_t received_body_len = request_len - conn->header_bytes;
+
+        if (unlikely(received_body_len < declared_len || declared_len < 16))
+        {
+            write_response(conn, response_400, response_400_len);
+        }
+        else
+        {
+            uint32_t magic = read_uint32_le((const uint8_t *)body);
+            if (memcmp(body, "JULY", 4) != 0 && magic != JULY_ENVELOPE_MAGIC && magic != 0x594C554A)
+            {
+                write_response(conn, response_400, response_400_len);
+            }
+            else
+            {
+                Task task = {0};
+                task.type = TASK_TYPE_WORKFLOW;
+                snprintf(task.taskId, sizeof(task.taskId), "wf_%ld_%d", (long)time(NULL), rand() % 100000);
+                snprintf(task.storageDir, sizeof(task.storageDir), "/tmp/july_storage/%s", task.taskId);
+                snprintf(task.sandboxDir, sizeof(task.sandboxDir), "/tmp/july_runs/%s", task.taskId);
+
+                mkdir_p(task.storageDir);
+
+                // Write envelope to WAL file
+                char envelope_path[512];
+                snprintf(envelope_path, sizeof(envelope_path), "%s/envelope.bin", task.storageDir);
+                int ef = open(envelope_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (ef >= 0)
+                {
+                    write(ef, body, declared_len);
+                    close(ef);
+                }
+
+                if (likely(enqueue_task(&task) == 0))
+                {
+                    task_result_record_enqueued(task.taskId);
+                    char resp[256];
+                    int rlen = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 202 Accepted\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "X-Task-Id: %s\r\n"
+                        "Content-Length: 15\r\n"
+                        "\r\n"
+                        "Workflow Queued",
+                        task.taskId);
+                    write_response(conn, resp, (size_t)rlen);
+                }
+                else
+                {
+                    write_response(conn, response_503, response_503_len);
+                }
+            }
         }
     }
     else if (conn->input[0] == 'P' && strncmp(conn->input, "POST /task ", 11) == 0)
@@ -830,7 +1451,7 @@ static void handle_sig(int sig)
 static void print_server_network_banner(int port, const char *backend)
 {
     printf("\n┌─────────────────────────────────────────────────────────────┐\n");
-    printf("│  July Task Execution Server (%-6s backend)               │\n", backend);
+    printf("│  July Task & Workflow Engine (%-6s backend)            │\n", backend);
     printf("│  Listening on: 0.0.0.0:%-5d (All LAN interfaces)          │\n", port);
     printf("│  Worker Pool:  %d threads                                   │\n", NUM_WORKERS);
     printf("├─────────────────────────────────────────────────────────────┤\n");
@@ -873,6 +1494,8 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
     signal(SIGPIPE, SIG_IGN);
+
+    srand((unsigned int)time(NULL));
 
     int port = PORT;
     if (argc > 1)
@@ -1011,6 +1634,14 @@ int main(int argc, char **argv)
                         continue;
                     }
                     conn->fd = client_fd;
+                    conn->input_cap = INITIAL_BUFFER_SIZE;
+                    conn->input = malloc(conn->input_cap);
+                    if (!conn->input)
+                    {
+                        close(client_fd);
+                        free(conn);
+                        continue;
+                    }
 
                     struct kevent client_events[2];
                     EV_SET(&client_events[0], client_fd, EVFILT_READ,
@@ -1019,8 +1650,7 @@ int main(int argc, char **argv)
                            EV_ADD | EV_DISABLE, 0, 0, conn);
                     if (unlikely(kevent(kq, client_events, 2, NULL, 0, NULL) < 0))
                     {
-                        close(client_fd);
-                        free(conn);
+                        close_connection(kq, conn);
                     }
                 }
                 continue;
@@ -1038,14 +1668,26 @@ int main(int argc, char **argv)
             {
                 for (;;)
                 {
-                    if (unlikely(conn->input_len >= BUFFER_SIZE - 1))
+                    if (conn->input_len >= conn->input_cap - 1)
                     {
-                        failed = true;
-                        break;
+                        size_t new_cap = conn->input_cap * 2;
+                        if (new_cap > MAX_PAYLOAD_SIZE)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        char *nb = realloc(conn->input, new_cap);
+                        if (!nb)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        conn->input = nb;
+                        conn->input_cap = new_cap;
                     }
                     ssize_t n = recv(conn->fd,
                                      conn->input + conn->input_len,
-                                     BUFFER_SIZE - 1 - conn->input_len, 0);
+                                     conn->input_cap - 1 - conn->input_len, 0);
                     if (likely(n > 0))
                     {
                         conn->input_len += (size_t)n;
@@ -1072,28 +1714,49 @@ int main(int argc, char **argv)
                         failed = true;
                     else if (request_len > 0)
                     {
-                        prepare_response(conn, (size_t)request_len);
+                        int p_res = prepare_response(conn, (size_t)request_len);
+                        if (p_res == 1)
+                        {
+                            close_connection(kq, conn);
+                            continue;
+                        }
                         int wr = flush_response(conn);
                         if (wr < 0)
                             failed = true;
+                        else if (wr == 0 && conn->close_after_write)
+                        {
+                            close_connection(kq, conn);
+                            continue;
+                        }
                         else if (wr == 1)
                         {
                             if (update_interest(kq, conn, EVFILT_WRITE) < 0)
                                 failed = true;
-                        }
-                        else if (conn->close_after_write)
-                        {
-                            close_connection(kq, conn);
-                            continue;
                         }
                         else
                         {
                             ssize_t next_len = complete_request_size(conn);
                             if (next_len > 0)
                             {
-                                prepare_response(conn, (size_t)next_len);
-                                if (update_interest(kq, conn, EVFILT_WRITE) < 0)
+                                int p_res2 = prepare_response(conn, (size_t)next_len);
+                                if (p_res2 == 1)
+                                {
+                                    close_connection(kq, conn);
+                                    continue;
+                                }
+                                int wr2 = flush_response(conn);
+                                if (wr2 < 0)
                                     failed = true;
+                                else if (wr2 == 0 && conn->close_after_write)
+                                {
+                                    close_connection(kq, conn);
+                                    continue;
+                                }
+                                else if (wr2 == 1)
+                                {
+                                    if (update_interest(kq, conn, EVFILT_WRITE) < 0)
+                                        failed = true;
+                                }
                             }
                             else if (next_len < 0)
                                 failed = true;
@@ -1119,8 +1782,26 @@ int main(int argc, char **argv)
                     ssize_t next_len = complete_request_size(conn);
                     if (next_len > 0)
                     {
-                        prepare_response(conn, (size_t)next_len);
-                        if (update_interest(kq, conn, EVFILT_WRITE) < 0)
+                        int p_res = prepare_response(conn, (size_t)next_len);
+                        if (p_res == 1)
+                        {
+                            close_connection(kq, conn);
+                            continue;
+                        }
+                        int wr2 = flush_response(conn);
+                        if (wr2 < 0)
+                            failed = true;
+                        else if (wr2 == 0 && conn->close_after_write)
+                        {
+                            close_connection(kq, conn);
+                            continue;
+                        }
+                        else if (wr2 == 1)
+                        {
+                            if (update_interest(kq, conn, EVFILT_WRITE) < 0)
+                                failed = true;
+                        }
+                        else if (update_interest(kq, conn, EVFILT_READ) < 0)
                             failed = true;
                     }
                     else if (next_len < 0)
@@ -1137,7 +1818,7 @@ int main(int argc, char **argv)
 
     close(kq);
 
-#else // Linux: epoll
+#else // Linux / epoll
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0)
@@ -1207,6 +1888,14 @@ int main(int argc, char **argv)
                         continue;
                     }
                     conn->fd = client_fd;
+                    conn->input_cap = INITIAL_BUFFER_SIZE;
+                    conn->input = malloc(conn->input_cap);
+                    if (!conn->input)
+                    {
+                        close(client_fd);
+                        free(conn);
+                        continue;
+                    }
 
                     struct epoll_event client_ev = {
                         .events = EPOLLIN | EPOLLRDHUP,
@@ -1214,8 +1903,7 @@ int main(int argc, char **argv)
                     };
                     if (unlikely(epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0))
                     {
-                        close(client_fd);
-                        free(conn);
+                        close_connection(epfd, conn);
                     }
                 }
                 continue;
@@ -1235,14 +1923,26 @@ int main(int argc, char **argv)
             {
                 for (;;)
                 {
-                    if (unlikely(conn->input_len >= BUFFER_SIZE - 1))
+                    if (conn->input_len >= conn->input_cap - 1)
                     {
-                        failed = true;
-                        break;
+                        size_t new_cap = conn->input_cap * 2;
+                        if (new_cap > MAX_PAYLOAD_SIZE)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        char *nb = realloc(conn->input, new_cap);
+                        if (!nb)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        conn->input = nb;
+                        conn->input_cap = new_cap;
                     }
                     ssize_t n = recv(conn->fd,
                                      conn->input + conn->input_len,
-                                     BUFFER_SIZE - 1 - conn->input_len, 0);
+                                     conn->input_cap - 1 - conn->input_len, 0);
                     if (likely(n > 0))
                     {
                         conn->input_len += (size_t)n;
@@ -1269,29 +1969,44 @@ int main(int argc, char **argv)
                         failed = true;
                     else if (request_len > 0)
                     {
-                        prepare_response(conn, (size_t)request_len);
+                        int p_res = prepare_response(conn, (size_t)request_len);
+                        if (p_res == 1)
+                        {
+                            close_connection(epfd, conn);
+                            continue;
+                        }
                         int wr = flush_response(conn);
                         if (wr < 0)
                             failed = true;
+                        else if (wr == 0 && conn->close_after_write)
+                        {
+                            close_connection(epfd, conn);
+                            continue;
+                        }
                         else if (wr == 1)
                         {
                             if (update_interest(epfd, conn, EPOLLIN | EPOLLOUT) < 0)
                                 failed = true;
-                        }
-                        else if (conn->close_after_write)
-                        {
-                            close_connection(epfd, conn);
-                            continue;
                         }
                         else
                         {
                             ssize_t next_len = complete_request_size(conn);
                             if (next_len > 0)
                             {
-                                prepare_response(conn, (size_t)next_len);
+                                int p_res2 = prepare_response(conn, (size_t)next_len);
+                                if (p_res2 == 1)
+                                {
+                                    close_connection(epfd, conn);
+                                    continue;
+                                }
                                 int wr2 = flush_response(conn);
                                 if (wr2 < 0)
                                     failed = true;
+                                else if (wr2 == 0 && conn->close_after_write)
+                                {
+                                    close_connection(epfd, conn);
+                                    continue;
+                                }
                                 else if (wr2 == 1)
                                 {
                                     if (update_interest(epfd, conn, EPOLLIN | EPOLLOUT) < 0)
@@ -1320,10 +2035,20 @@ int main(int argc, char **argv)
                     ssize_t next_len = complete_request_size(conn);
                     if (next_len > 0)
                     {
-                        prepare_response(conn, (size_t)next_len);
+                        int p_res = prepare_response(conn, (size_t)next_len);
+                        if (p_res == 1)
+                        {
+                            close_connection(epfd, conn);
+                            continue;
+                        }
                         int wr2 = flush_response(conn);
                         if (wr2 < 0)
                             failed = true;
+                        else if (wr2 == 0 && conn->close_after_write)
+                        {
+                            close_connection(epfd, conn);
+                            continue;
+                        }
                         else if (wr2 == 1)
                         {
                             if (update_interest(epfd, conn, EPOLLIN | EPOLLOUT) < 0)

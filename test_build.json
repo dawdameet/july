@@ -1,0 +1,16 @@
+{
+  "name": "hello-workflow",
+  "options": {
+    "timeout_sec": 10,
+    "kill_if_timeout": true
+  },
+  "pre_flight": {
+    "check_tools": ["gcc"]
+  },
+  "build": [
+    "gcc -O2 main.c -o app"
+  ],
+  "required_artifacts": [
+    "app"
+  ]
+}

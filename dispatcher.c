@@ -8,16 +8,20 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+
 #include "task.h"
+#include "workflow.h"
 
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 8080
-#define DEFAULT_TIMEOUT_SEC 15
+#define DEFAULT_TIMEOUT_SEC 30
 #define RESPONSE_BUF_SIZE 65536
 
 /* ANSI Color Escape Codes */
@@ -43,8 +47,7 @@ static inline void pack_uint32_le(uint8_t *dst, uint32_t val)
 static bool parse_target_spec(const char *arg, char *out_host, size_t max_host, int *out_port)
 {
     char temp[256];
-    strncpy(temp, arg, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = '\0';
+    safe_copy_str(temp, sizeof(temp), arg);
 
     char *colon = strchr(temp, ':');
     if (colon)
@@ -54,8 +57,7 @@ static bool parse_target_spec(const char *arg, char *out_host, size_t max_host, 
         if (p > 0 && p <= 65535)
         {
             *out_port = p;
-            strncpy(out_host, temp, max_host - 1);
-            out_host[max_host - 1] = '\0';
+            safe_copy_str(out_host, max_host, temp);
             return true;
         }
     }
@@ -63,16 +65,13 @@ static bool parse_target_spec(const char *arg, char *out_host, size_t max_host, 
     struct in_addr addr;
     if (inet_pton(AF_INET, temp, &addr) == 1)
     {
-        strncpy(out_host, temp, max_host - 1);
-        out_host[max_host - 1] = '\0';
+        safe_copy_str(out_host, max_host, temp);
         return true;
     }
 
-    // Check if it ends in common local domain (e.g. .local or localhost)
     if (strcmp(temp, "localhost") == 0 || strstr(temp, ".local"))
     {
-        strncpy(out_host, temp, max_host - 1);
-        out_host[max_host - 1] = '\0';
+        safe_copy_str(out_host, max_host, temp);
         return true;
     }
 
@@ -86,7 +85,7 @@ static int connect_to_server(const char *host, int port)
 
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET; // IPv4
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
     int err = getaddrinfo(host, port_str, &hints, &res);
@@ -102,13 +101,12 @@ static int connect_to_server(const char *host, int port)
         if (sock < 0)
             continue;
 
-        // Set socket timeouts to prevent client hanging if remote host is unresponsive
         struct timeval tv = {.tv_sec = DEFAULT_TIMEOUT_SEC, .tv_usec = 0};
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
-            break; // Success
+            break;
 
         close(sock);
         sock = -1;
@@ -165,8 +163,6 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
     {
         fprintf(stderr, "%s[!] Failed to connect to server at %s:%d%s\n",
                 use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
-        fprintf(stderr, "%s    -> Ensure the server is running on the target machine and port %d is open in the firewall (e.g. 'sudo ufw allow %d/tcp').%s\n",
-                use_colors ? COLOR_YELLOW : "", port, port, use_colors ? COLOR_RESET : "");
         free(payload);
         return -1;
     }
@@ -201,26 +197,19 @@ static int dispatch_task(const char *host, int port, const char *task_id, const 
     response[n] = '\0';
 
     int status_code = 0;
-    if (sscanf(response, "HTTP/1.1 %d", &status_code) != 1)
-    {
-        fprintf(stderr, "%s[!] Invalid HTTP response:%s\n%s\n",
-                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "", response);
-        return -1;
-    }
-
-    if (status_code != 202)
+    if (sscanf(response, "HTTP/1.1 %d", &status_code) != 1 || status_code != 202)
     {
         fprintf(stderr, "%s[!] Task submission rejected (HTTP %d)%s\n",
                 use_colors ? COLOR_RED : "", status_code, use_colors ? COLOR_RESET : "");
         return -1;
     }
 
-    return 0; // Successfully queued
+    return 0;
 }
 
 /* Retrieve task status and output from GET /retrieve/<taskId> */
 static int retrieve_task(const char *host, int port, const char *task_id,
-                         int *exit_code, char **output_body, size_t *output_len)
+                         int *exit_code, int *artifacts_count, char **output_body, size_t *output_len)
 {
     int sock = connect_to_server(host, port);
     if (sock < 0)
@@ -305,6 +294,16 @@ static int retrieve_task(const char *host, int port, const char *task_id,
         sscanf(code_hdr + 17, "%d", exit_code);
     }
 
+    if (artifacts_count)
+    {
+        *artifacts_count = 0;
+        char *art_hdr = strcasestr(buf, "X-Artifacts-Count:");
+        if (art_hdr)
+        {
+            sscanf(art_hdr + 18, "%d", artifacts_count);
+        }
+    }
+
     char *body_start = strstr(buf, "\r\n\r\n");
     if (!body_start)
     {
@@ -327,27 +326,361 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     return 0; // Completed
 }
 
-static int wait_for_task_completion(const char *host, int port, const char *task_id,
-                                    int timeout_sec, int *exit_code,
-                                    char **output, size_t *output_len)
+/* Download an artifact file from GET /retrieve/<taskId>/artifact/<filename> */
+static int download_artifact(const char *host, int port, const char *task_id, const char *artifact_name)
 {
+    int sock = connect_to_server(host, port);
+    if (sock < 0)
+        return -1;
+
+    char request[512];
+    int req_len = snprintf(request, sizeof(request),
+        "GET /retrieve/%s/artifact/%s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        task_id, artifact_name, host, port);
+
+    if (write(sock, request, req_len) != req_len)
+    {
+        close(sock);
+        return -1;
+    }
+
+    // Read header first
+    size_t cap = 8192;
+    size_t total = 0;
+    char *buf = malloc(cap);
+    if (!buf)
+    {
+        close(sock);
+        return -1;
+    }
+
+    char *header_end = NULL;
+    while (!header_end)
+    {
+        ssize_t n = read(sock, buf + total, cap - 1 - total);
+        if (n <= 0)
+            break;
+        total += (size_t)n;
+        buf[total] = '\0';
+        header_end = strstr(buf, "\r\n\r\n");
+        if (!header_end && total >= cap - 1)
+        {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); close(sock); return -1; }
+            buf = nb;
+        }
+    }
+
+    if (!header_end)
+    {
+        free(buf);
+        close(sock);
+        return -1;
+    }
+
+    int status_code = 0;
+    if (sscanf(buf, "HTTP/1.1 %d", &status_code) != 1 || status_code != 200)
+    {
+        free(buf);
+        close(sock);
+        return -1;
+    }
+
+    size_t content_len = 0;
+    char *cl = strcasestr(buf, "Content-Length:");
+    if (cl)
+    {
+        content_len = (size_t)strtoull(cl + 15, NULL, 10);
+    }
+
+    char *body = header_end + 4;
+    size_t body_in_buf = (size_t)(buf + total - body);
+
+    mkdir_p_parent(artifact_name);
+    int out_fd = open(artifact_name, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out_fd < 0)
+    {
+        free(buf);
+        close(sock);
+        return -1;
+    }
+
+    if (body_in_buf > 0)
+    {
+        write(out_fd, body, body_in_buf);
+    }
+
+    size_t written = body_in_buf;
+    while (written < content_len)
+    {
+        char chunk[16384];
+        ssize_t n = read(sock, chunk, sizeof(chunk));
+        if (n <= 0)
+            break;
+        write(out_fd, chunk, (size_t)n);
+        written += (size_t)n;
+    }
+
+    close(out_fd);
+    close(sock);
+    free(buf);
+
+    chmod(artifact_name, 0755);
+    return 0;
+}
+
+/* Dispatch binary multi-file envelope workflow */
+static int dispatch_workflow(const char *host, int port, const char *manifest_file,
+                             int num_files, char **files, int timeout_sec)
+{
+    printf("%s[+] Packing workflow container...%s\n",
+           use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
+    printf("%s    • Manifest file: %s%s\n",
+           use_colors ? COLOR_CYAN : "", manifest_file, use_colors ? COLOR_RESET : "");
+    printf("%s    • Bundled files: %d%s\n",
+           use_colors ? COLOR_CYAN : "", num_files, use_colors ? COLOR_RESET : "");
+
+    FILE *mf = fopen(manifest_file, "rb");
+    if (!mf)
+    {
+        fprintf(stderr, "%s[!] Cannot open manifest file '%s': %s%s\n",
+                use_colors ? COLOR_RED : "", manifest_file, strerror(errno), use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+    fseek(mf, 0, SEEK_END);
+    long mlen = ftell(mf);
+    fseek(mf, 0, SEEK_SET);
+    char *manifest_json = malloc(mlen + 1);
+    if (!manifest_json)
+    {
+        fclose(mf);
+        return 1;
+    }
+    if (fread(manifest_json, 1, mlen, mf) != (size_t)mlen)
+    {
+        fclose(mf);
+        free(manifest_json);
+        return 1;
+    }
+    manifest_json[mlen] = '\0';
+    fclose(mf);
+
+    WorkflowManifest manifest;
+    if (parse_workflow_manifest(manifest_json, mlen, &manifest) != 0)
+    {
+        fprintf(stderr, "%s[!] Failed to parse JSON manifest in '%s'%s\n",
+                use_colors ? COLOR_RED : "", manifest_file, use_colors ? COLOR_RESET : "");
+        free(manifest_json);
+        return 1;
+    }
+
+    if (timeout_sec <= 0)
+        timeout_sec = manifest.timeout_sec > 0 ? manifest.timeout_sec : DEFAULT_TIMEOUT_SEC;
+
+    printf("%s    • Workflow Name: %s%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.name, use_colors ? COLOR_RESET : "");
+    printf("%s    • Pre-flight Probe: %d tool(s) | Dependencies: %d | Build Steps: %d%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.num_check_tools, manifest.num_deps, manifest.num_build_cmds, use_colors ? COLOR_RESET : "");
+    printf("%s    • Required Artifacts: %d%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.num_required_artifacts, use_colors ? COLOR_RESET : "");
+
+    // Calculate binary envelope size
+    size_t envelope_size = 12 + mlen + 4;
+    for (int i = 0; i < num_files; i++)
+    {
+        struct stat st;
+        if (stat(files[i], &st) < 0)
+        {
+            fprintf(stderr, "%s[!] Source file not found: '%s'%s\n",
+                    use_colors ? COLOR_RED : "", files[i], use_colors ? COLOR_RESET : "");
+            free(manifest_json);
+            return 1;
+        }
+        size_t path_len = strlen(files[i]);
+        if (path_len >= MAX_PATH_LEN)
+        {
+            fprintf(stderr, "%s[!] File path too long: '%s'%s\n",
+                    use_colors ? COLOR_RED : "", files[i], use_colors ? COLOR_RESET : "");
+            free(manifest_json);
+            return 1;
+        }
+        envelope_size += 2 + path_len + 2 + 8 + (size_t)st.st_size;
+    }
+
+    uint8_t *envelope = malloc(envelope_size);
+    if (!envelope)
+    {
+        perror("malloc envelope");
+        free(manifest_json);
+        return 1;
+    }
+
+    // Write Envelope Header
+    envelope[0] = 'J';
+    envelope[1] = 'U';
+    envelope[2] = 'L';
+    envelope[3] = 'Y';
+    write_uint16_le(envelope + 4, JULY_ENVELOPE_VERSION);
+    write_uint16_le(envelope + 6, 0); // flags
+    write_uint32_le(envelope + 8, (uint32_t)mlen);
+    memcpy(envelope + 12, manifest_json, mlen);
+    write_uint32_le(envelope + 12 + mlen, (uint32_t)num_files);
+
+    uint8_t *p = envelope + 12 + mlen + 4;
+    for (int i = 0; i < num_files; i++)
+    {
+        struct stat st;
+        stat(files[i], &st);
+        const char *rel_name = files[i];
+        if (strncmp(rel_name, "./", 2) == 0)
+            rel_name += 2;
+
+        uint16_t plen = (uint16_t)strlen(rel_name);
+        write_uint16_le(p, plen);
+        p += 2;
+        memcpy(p, rel_name, plen);
+        p += plen;
+        write_uint16_le(p, (uint16_t)(st.st_mode & 0777));
+        p += 2;
+        write_uint64_le(p, (uint64_t)st.st_size);
+        p += 8;
+
+        int fd = open(files[i], O_RDONLY);
+        if (fd >= 0)
+        {
+            if (st.st_size > 0)
+            {
+                read(fd, p, (size_t)st.st_size);
+            }
+            close(fd);
+        }
+        p += st.st_size;
+    }
+    free(manifest_json);
+
+    printf("%s[+] Connecting to %s:%d...%s\n",
+           use_colors ? COLOR_BLUE : "", host, port, use_colors ? COLOR_RESET : "");
+
+    int sock = connect_to_server(host, port);
+    if (sock < 0)
+    {
+        fprintf(stderr, "%s[!] Failed to connect to server at %s:%d%s\n",
+                use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
+        free(envelope);
+        return 1;
+    }
+
+    char req_headers[512];
+    int hlen = snprintf(req_headers, sizeof(req_headers),
+        "POST /workflow HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        host, port, envelope_size);
+
+    if (write(sock, req_headers, hlen) != hlen)
+    {
+        perror("write headers");
+        close(sock);
+        free(envelope);
+        return 1;
+    }
+
+    size_t written = 0;
+    while (written < envelope_size)
+    {
+        ssize_t w = write(sock, envelope + written, envelope_size - written);
+        if (w <= 0)
+        {
+            if (w < 0 && errno == EINTR) continue;
+            perror("write envelope body");
+            close(sock);
+            free(envelope);
+            return 1;
+        }
+        written += (size_t)w;
+    }
+    free(envelope);
+
+    char resp_buf[1024];
+    size_t total_resp = 0;
+    while (total_resp < sizeof(resp_buf) - 1)
+    {
+        ssize_t n = read(sock, resp_buf + total_resp, sizeof(resp_buf) - 1 - total_resp);
+        if (n <= 0)
+            break;
+        total_resp += (size_t)n;
+        resp_buf[total_resp] = '\0';
+        if (strstr(resp_buf, "\r\n\r\n"))
+            break;
+    }
+    close(sock);
+
+    if (total_resp == 0)
+    {
+        fprintf(stderr, "%s[!] Empty response from server on workflow submit%s\n",
+                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+
+    int status_code = 0;
+    if (sscanf(resp_buf, "HTTP/1.1 %d", &status_code) != 1 || status_code != 202)
+    {
+        fprintf(stderr, "%s[!] Workflow submission failed (HTTP %d):\n%s%s\n",
+                use_colors ? COLOR_RED : "", status_code, resp_buf, use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+
+    char task_id[MAX_TASK_ID] = {0};
+    char *id_hdr = strcasestr(resp_buf, "X-Task-Id:");
+    if (id_hdr)
+    {
+        sscanf(id_hdr + 10, "%63s", task_id);
+    }
+    if (task_id[0] == '\0')
+    {
+        fprintf(stderr, "%s[!] No X-Task-Id returned from server%s\n",
+                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+
+    printf("%s[✓] Workflow '%s' enqueued successfully! (Task ID: %s)%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.name, task_id, use_colors ? COLOR_RESET : "");
+    printf("%s[*] Streaming execution logs from server OS Page Cache...%s\n\n",
+           use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
+
+    // Poll for completion
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    int exit_code = 0;
+    int artifacts_count = 0;
+    char *log_output = NULL;
+    size_t log_len = 0;
+
     while (1)
     {
-        int res = retrieve_task(host, port, task_id, exit_code, output, output_len);
+        int res = retrieve_task(host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
         if (res == 0)
         {
-            return 0; // Finished
+            // Completed!
+            break;
         }
-        if (res == -2)
+        else if (res == -2)
         {
-            usleep(10000); // 10 ms
+            usleep(20000); // 20ms
         }
         else if (res < 0)
         {
-            return -1; // Error
+            fprintf(stderr, "%s[!] Network error retrieving workflow status%s\n",
+                    use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+            return 1;
         }
 
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -355,63 +688,86 @@ static int wait_for_task_completion(const char *host, int port, const char *task
                          (double)(now.tv_nsec - start.tv_nsec) / 1e9;
         if (elapsed >= timeout_sec)
         {
-            return -3; // Timed out waiting
+            fprintf(stderr, "%s[!] Workflow execution timed out after %ds%s\n",
+                    use_colors ? COLOR_RED : "", timeout_sec, use_colors ? COLOR_RESET : "");
+            return 124;
         }
 
-        usleep(25000); // 25 ms polling interval
+        usleep(50000); // 50ms polling
     }
+
+    // Print full execution log
+    if (log_len > 0 && log_output)
+    {
+        fwrite(log_output, 1, log_len, stdout);
+        if (log_output[log_len - 1] != '\n')
+            putchar('\n');
+        free(log_output);
+    }
+
+    if (exit_code != 0)
+    {
+        printf("\n%s[✗] Workflow FAILED with exit code %d%s\n",
+               use_colors ? COLOR_RED : "", exit_code, use_colors ? COLOR_RESET : "");
+        return exit_code;
+    }
+
+    printf("\n%s[✓] Workflow Completed Successfully (Exit Code: 0)!%s\n",
+           use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "");
+
+    // Stage 5: Zero-copy artifact retrieval
+    if (manifest.num_required_artifacts > 0)
+    {
+        printf("%s[*] Downloading %d required artifact(s) via zero-copy sendfile()...%s\n",
+               use_colors ? COLOR_CYAN : "", manifest.num_required_artifacts, use_colors ? COLOR_RESET : "");
+
+        for (int i = 0; i < manifest.num_required_artifacts; i++)
+        {
+            const char *art = manifest.required_artifacts[i];
+            printf("%s    ➔ Downloading '%s'...%s ",
+                   use_colors ? COLOR_BLUE : "", art, use_colors ? COLOR_RESET : "");
+            fflush(stdout);
+
+            if (download_artifact(host, port, task_id, art) == 0)
+            {
+                struct stat ast;
+                stat(art, &ast);
+                printf("%s[DONE] (%ld bytes)%s\n",
+                       use_colors ? COLOR_GREEN : "", (long)ast.st_size, use_colors ? COLOR_RESET : "");
+            }
+            else
+            {
+                printf("%s[FAILED]%s\n",
+                       use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+            }
+        }
+    }
+
+    return 0;
 }
 
 static void print_help(const char *prog)
 {
-    printf("\n%sTask Dispatcher (LAN & Local)%s\n\n",
+    printf("\n%sJuly Task & Workflow Dispatcher%s\n\n",
            use_colors ? COLOR_BOLD : "", use_colors ? COLOR_RESET : "");
     printf("Usage:\n");
-    printf("  %s [host:port] [command]           Execute command on local or remote machine\n", prog);
-    printf("  %s [host:port]                     Open interactive shell targeting host\n", prog);
-    printf("  %s                                 Open interactive shell (default: 127.0.0.1:8080)\n\n", prog);
+    printf("  # Workflow Container Execution:\n");
+    printf("  %s [host:port] workflow <manifest.json> [files...]\n", prog);
+    printf("  %s workflow <manifest.json> [files...]\n\n", prog);
+    printf("  # Shell Command Execution:\n");
+    printf("  %s [host:port] \"<command>\"\n", prog);
+    printf("  %s [host:port]                     (Interactive REPL targeting host)\n", prog);
+    printf("  %s                                 (Interactive REPL default localhost:8080)\n\n", prog);
     printf("Options:\n");
     printf("  -h, --host <host>       Server IP or hostname (default: %s)\n", DEFAULT_HOST);
     printf("  -p, --port <port>       Server port (default: %d)\n", DEFAULT_PORT);
     printf("  -t, --timeout <sec>     Execution timeout in seconds (default: %d)\n", DEFAULT_TIMEOUT_SEC);
-    printf("  -i, --id <taskId>       Custom task ID (default: auto-generated)\n");
-    printf("  -a, --async             Dispatch task asynchronously without waiting for output\n");
-    printf("  -g, --get <taskId>      Retrieve output of a previously dispatched task\n");
-    printf("  --no-color              Disable ANSI colors\n");
+    printf("  -g, --get <taskId>      Retrieve output or artifact status of a task\n");
+    printf("  --no-color              Disable ANSI color output\n");
     printf("  --help                  Show this help message\n\n");
-    printf("LAN Examples (Mac -> Linux):\n");
-    printf("  %s 192.168.1.50 \"uname -a\"\n", prog);
-    printf("  %s 192.168.1.50:9000 \"df -h\"\n", prog);
-    printf("  %s 192.168.1.50                    (Starts interactive shell to Linux machine)\n", prog);
-    printf("  %s -h 192.168.1.50 -p 8080 \"free -m\"\n\n", prog);
-}
-
-static double ping_server(const char *host, int port)
-{
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    int s = connect_to_server(host, port);
-    if (s < 0)
-        return -1.0;
-
-    const char *ping_req = "GET / HTTP/1.1\r\nHost: ping\r\nConnection: close\r\n\r\n";
-    if (write(s, ping_req, strlen(ping_req)) <= 0)
-    {
-        close(s);
-        return -1.0;
-    }
-
-    char buf[128];
-    ssize_t n = read(s, buf, sizeof(buf));
-    close(s);
-
-    if (n <= 0)
-        return -1.0;
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    return ((double)(end.tv_sec - start.tv_sec) * 1000.0) +
-           ((double)(end.tv_nsec - start.tv_nsec) / 1e6);
+    printf("Workflow Example:\n");
+    printf("  %s workflow test_build.json main.c Makefile\n", prog);
+    printf("  %s 192.168.1.50 workflow build.json src/main.c src/util.h\n\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -419,24 +775,23 @@ int main(int argc, char **argv)
     use_colors = isatty(fileno(stdout));
 
     char host[256];
-    strncpy(host, DEFAULT_HOST, sizeof(host) - 1);
-    host[sizeof(host) - 1] = '\0';
+    safe_copy_str(host, sizeof(host), DEFAULT_HOST);
     int port = DEFAULT_PORT;
     int timeout_sec = DEFAULT_TIMEOUT_SEC;
-    const char *custom_task_id = NULL;
     const char *retrieve_id = NULL;
-    bool async_mode = false;
     char command_buf[MAX_TASK_CMD] = {0};
 
     // Environment overrides
     const char *env_host = getenv("DISPATCHER_HOST");
-    if (env_host) strncpy(host, env_host, sizeof(host) - 1);
+    if (env_host) safe_copy_str(host, sizeof(host), env_host);
     const char *env_port = getenv("DISPATCHER_PORT");
     if (env_port) port = atoi(env_port);
 
     bool host_set_by_pos = false;
+    bool workflow_mode = false;
+    const char *manifest_file = NULL;
+    int workflow_files_start = 0;
 
-    // Argument parsing
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--help") == 0)
@@ -448,13 +803,9 @@ int main(int argc, char **argv)
         {
             use_colors = false;
         }
-        else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--async") == 0)
-        {
-            async_mode = true;
-        }
         else if ((strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--host") == 0) && i + 1 < argc)
         {
-            strncpy(host, argv[++i], sizeof(host) - 1);
+            safe_copy_str(host, sizeof(host), argv[++i]);
         }
         else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc)
         {
@@ -464,31 +815,35 @@ int main(int argc, char **argv)
         {
             timeout_sec = atoi(argv[++i]);
         }
-        else if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--id") == 0) && i + 1 < argc)
-        {
-            custom_task_id = argv[++i];
-        }
         else if ((strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--get") == 0) && i + 1 < argc)
         {
             retrieve_id = argv[++i];
         }
+        else if (strcmp(argv[i], "workflow") == 0)
+        {
+            workflow_mode = true;
+            if (i + 1 < argc)
+            {
+                manifest_file = argv[++i];
+                workflow_files_start = i + 1;
+            }
+            break;
+        }
         else if (argv[i][0] != '-')
         {
-            // If the first positional argument is an IP or host:port, treat it as target
             if (!host_set_by_pos && command_buf[0] == '\0')
             {
                 char parsed_host[256];
                 int parsed_port = port;
                 if (parse_target_spec(argv[i], parsed_host, sizeof(parsed_host), &parsed_port))
                 {
-                    strncpy(host, parsed_host, sizeof(host) - 1);
+                    safe_copy_str(host, sizeof(host), parsed_host);
                     port = parsed_port;
                     host_set_by_pos = true;
                     continue;
                 }
             }
 
-            // Append positional argument to command buffer
             if (command_buf[0] != '\0')
             {
                 strncat(command_buf, " ", sizeof(command_buf) - strlen(command_buf) - 1);
@@ -497,20 +852,38 @@ int main(int argc, char **argv)
         }
     }
 
-    // If query mode requested:
+    // 1. Workflow Container Dispatch Mode
+    if (workflow_mode)
+    {
+        if (!manifest_file)
+        {
+            fprintf(stderr, "%s[!] Missing manifest file for workflow! Usage: %s workflow <manifest.json> [files...]%s\n",
+                    use_colors ? COLOR_RED : "", argv[0], use_colors ? COLOR_RESET : "");
+            return 1;
+        }
+        int num_files = argc - workflow_files_start;
+        if (num_files < 0)
+            num_files = 0;
+        char **files = num_files > 0 ? &argv[workflow_files_start] : NULL;
+
+        return dispatch_workflow(host, port, manifest_file, num_files, files, timeout_sec);
+    }
+
+    // 2. Query/Retrieve Mode
     if (retrieve_id)
     {
         printf("%s[*] Querying task '%s' from %s:%d...%s\n",
                use_colors ? COLOR_BLUE : "", retrieve_id, host, port, use_colors ? COLOR_RESET : "");
         int exit_code = 0;
+        int art_count = 0;
         char *output = NULL;
         size_t out_len = 0;
-        int res = retrieve_task(host, port, retrieve_id, &exit_code, &output, &out_len);
+        int res = retrieve_task(host, port, retrieve_id, &exit_code, &art_count, &output, &out_len);
         if (res == 0)
         {
-            printf("%s[✓] Task '%s' Completed (Exit Code: %d):%s\n",
+            printf("%s[✓] Task '%s' Completed (Exit Code: %d, Artifacts: %d):%s\n",
                    use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
-                   retrieve_id, exit_code, use_colors ? COLOR_RESET : "");
+                   retrieve_id, exit_code, art_count, use_colors ? COLOR_RESET : "");
             if (out_len > 0 && output)
             {
                 fwrite(output, 1, out_len, stdout);
@@ -526,32 +899,19 @@ int main(int argc, char **argv)
                    use_colors ? COLOR_YELLOW : "", retrieve_id, use_colors ? COLOR_RESET : "");
             return 0;
         }
-        else if (res == -2)
-        {
-            fprintf(stderr, "%s[!] Task '%s' not found on server.%s\n",
-                    use_colors ? COLOR_RED : "", retrieve_id, use_colors ? COLOR_RESET : "");
-            return 1;
-        }
         else
         {
-            fprintf(stderr, "%s[!] Failed to retrieve task '%s'.%s\n",
+            fprintf(stderr, "%s[!] Task '%s' not found or error.%s\n",
                     use_colors ? COLOR_RED : "", retrieve_id, use_colors ? COLOR_RESET : "");
             return 1;
         }
     }
 
-    // One-shot command execution
+    // 3. One-Shot Command Execution
     if (command_buf[0] != '\0')
     {
         char task_id[MAX_TASK_ID];
-        if (custom_task_id)
-        {
-            snprintf(task_id, sizeof(task_id), "%s", custom_task_id);
-        }
-        else
-        {
-            snprintf(task_id, sizeof(task_id), "task_%ld_%d", (long)time(NULL), getpid());
-        }
+        snprintf(task_id, sizeof(task_id), "cmd_%ld_%d", (long)time(NULL), getpid());
 
         printf("%s[+] Target: %s:%d | Task: %s%s\n",
                use_colors ? COLOR_CYAN : "", host, port, task_id, use_colors ? COLOR_RESET : "");
@@ -562,73 +922,42 @@ int main(int argc, char **argv)
         if (dispatch_task(host, port, task_id, command_buf) != 0)
             return 1;
 
-        if (async_mode)
-        {
-            printf("%s[✓] Task queued in async mode.%s Retrieve anytime with: %s -h %s -p %d -g %s\n",
-                   use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "",
-                   argv[0], host, port, task_id);
-            return 0;
-        }
-
         int exit_code = 0;
+        int art_count = 0;
         char *output = NULL;
         size_t out_len = 0;
-        int res = wait_for_task_completion(host, port, task_id, timeout_sec,
-                                           &exit_code, &output, &out_len);
-        if (res == 0)
+        while (1)
         {
-            printf("%s[✓] Completed (exit=%d):%s\n",
-                   use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
-                   exit_code, use_colors ? COLOR_RESET : "");
-            if (out_len > 0 && output)
-            {
-                fwrite(output, 1, out_len, stdout);
-                if (output[out_len - 1] != '\n')
-                    putchar('\n');
-            }
+            int res = retrieve_task(host, port, task_id, &exit_code, &art_count, &output, &out_len);
+            if (res == 0)
+                break;
+            usleep(25000);
+        }
+
+        printf("%s[✓] Completed (exit=%d):%s\n",
+               use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
+               exit_code, use_colors ? COLOR_RESET : "");
+        if (out_len > 0 && output)
+        {
+            fwrite(output, 1, out_len, stdout);
+            if (output[out_len - 1] != '\n')
+                putchar('\n');
             free(output);
-            return exit_code;
         }
-        else if (res == -3)
-        {
-            fprintf(stderr, "%s[!] Task execution timed out after %ds (task still running on server)%s\n",
-                    use_colors ? COLOR_RED : "", timeout_sec, use_colors ? COLOR_RESET : "");
-            return 124;
-        }
-        else
-        {
-            fprintf(stderr, "%s[!] Failed to get task results from %s:%d%s\n",
-                    use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
-            return 1;
-        }
+        return exit_code;
     }
 
-    // ─── Interactive Shell REPL Mode ───
+    // 4. Interactive REPL
     printf("%s┌─────────────────────────────────────────────────────────────┐%s\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
-    printf("%s│             Task Dispatcher (LAN & Local CLI)               │%s\n",
+    printf("%s│             July Task & Workflow Dispatcher                 │%s\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
     printf("%s│  Target: %-49s  │%s\n",
            use_colors ? COLOR_CYAN : "", host, use_colors ? COLOR_RESET : "");
     printf("%s│  Port:   %-49d  │%s\n",
            use_colors ? COLOR_CYAN : "", port, use_colors ? COLOR_RESET : "");
-    printf("%s│  Commands: 'ping', 'target <ip>', 'help', 'exit'            │%s\n",
-           use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
     printf("%s└─────────────────────────────────────────────────────────────┘%s\n\n",
            use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
-
-    // Quick connectivity check
-    double rtt = ping_server(host, port);
-    if (rtt >= 0.0)
-    {
-        printf("%s[✓] Connected to %s:%d (RTT: %.2f ms)%s\n\n",
-               use_colors ? COLOR_GREEN : "", host, port, rtt, use_colors ? COLOR_RESET : "");
-    }
-    else
-    {
-        printf("%s[!] Cannot connect to %s:%d. Make sure the server is running and firewall allows port %d.%s\n\n",
-               use_colors ? COLOR_RED : "", host, port, port, use_colors ? COLOR_RESET : "");
-    }
 
     char line[MAX_TASK_CMD];
     int task_counter = 1;
@@ -641,119 +970,44 @@ int main(int argc, char **argv)
         fflush(stdout);
 
         if (!fgets(line, sizeof(line), stdin))
-        {
-            printf("\nExiting...\n");
             break;
-        }
 
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' '))
-        {
             line[--len] = '\0';
-        }
 
         if (len == 0)
             continue;
-
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0)
-        {
-            printf("Goodbye.\n");
             break;
-        }
-        if (strcmp(line, "help") == 0)
-        {
-            printf("Built-in Dispatcher commands:\n");
-            printf("  ping / status         Check connection and round-trip latency to %s:%d\n", host, port);
-            printf("  target <ip> [port]    Switch target server (e.g. 'target 192.168.1.50')\n");
-            printf("  exit / quit           Exit interactive mode\n");
-            printf("All other commands are dispatched to the remote Linux/POSIX worker.\n");
-            continue;
-        }
-        if (strcmp(line, "ping") == 0 || strcmp(line, "status") == 0)
-        {
-            double ping_ms = ping_server(host, port);
-            if (ping_ms >= 0.0)
-            {
-                printf("%s[✓] Server at %s:%d is ONLINE (Latency: %.2f ms)%s\n",
-                       use_colors ? COLOR_GREEN : "", host, port, ping_ms, use_colors ? COLOR_RESET : "");
-            }
-            else
-            {
-                printf("%s[✗] Server at %s:%d is UNREACHABLE%s\n",
-                       use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
-            }
-            continue;
-        }
-        if (strncmp(line, "target ", 7) == 0)
-        {
-            char new_spec[256];
-            int new_port = port;
-            if (sscanf(line + 7, "%255s %d", new_spec, &new_port) >= 1)
-            {
-                char parsed_h[256];
-                int p = new_port;
-                if (parse_target_spec(new_spec, parsed_h, sizeof(parsed_h), &p))
-                {
-                    strncpy(host, parsed_h, sizeof(host) - 1);
-                    port = p;
-                }
-                else
-                {
-                    strncpy(host, new_spec, sizeof(host) - 1);
-                    port = new_port;
-                }
-                double p_ms = ping_server(host, port);
-                if (p_ms >= 0.0)
-                {
-                    printf("%s[✓] Switched target to %s:%d (RTT: %.2f ms)%s\n",
-                           use_colors ? COLOR_GREEN : "", host, port, p_ms, use_colors ? COLOR_RESET : "");
-                }
-                else
-                {
-                    printf("%s[!] Switched target to %s:%d, but server is currently unreachable.%s\n",
-                           use_colors ? COLOR_YELLOW : "", host, port, use_colors ? COLOR_RESET : "");
-                }
-            }
-            continue;
-        }
 
         char task_id[MAX_TASK_ID];
         snprintf(task_id, sizeof(task_id), "t_%d", task_counter++);
-
-        printf("%s[+] Submitting task '%s' to %s:%d...%s\n",
-               use_colors ? COLOR_BLUE : "", task_id, host, port, use_colors ? COLOR_RESET : "");
 
         if (dispatch_task(host, port, task_id, line) != 0)
             continue;
 
         int exit_code = 0;
+        int art_count = 0;
         char *output = NULL;
         size_t out_len = 0;
+        while (1)
+        {
+            int res = retrieve_task(host, port, task_id, &exit_code, &art_count, &output, &out_len);
+            if (res == 0)
+                break;
+            usleep(25000);
+        }
 
-        int res = wait_for_task_completion(host, port, task_id, timeout_sec,
-                                           &exit_code, &output, &out_len);
-        if (res == 0)
+        printf("%s[✓] (exit=%d):%s\n",
+               use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
+               exit_code, use_colors ? COLOR_RESET : "");
+        if (out_len > 0 && output)
         {
-            printf("%s[✓] Completed (exit=%d):%s\n",
-                   use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
-                   exit_code, use_colors ? COLOR_RESET : "");
-            if (out_len > 0 && output)
-            {
-                fwrite(output, 1, out_len, stdout);
-                if (output[out_len - 1] != '\n')
-                    putchar('\n');
-            }
+            fwrite(output, 1, out_len, stdout);
+            if (output[out_len - 1] != '\n')
+                putchar('\n');
             free(output);
-        }
-        else if (res == -3)
-        {
-            printf("%s[!] Execution timed out after %ds%s\n",
-                   use_colors ? COLOR_RED : "", timeout_sec, use_colors ? COLOR_RESET : "");
-        }
-        else
-        {
-            printf("%s[!] Failed to retrieve task output from %s:%d%s\n",
-                   use_colors ? COLOR_RED : "", host, port, use_colors ? COLOR_RESET : "");
         }
     }
 
