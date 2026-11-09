@@ -11,6 +11,7 @@ tests/**/sys_bench
 tests/**/matrix_simd
 tests/**/kv_engine
 tests/**/tick_gen
+tests/**/sandbox_probe
 tests/**/*.bin
 tests/**/*.json
 !tests/**/workflow.json
