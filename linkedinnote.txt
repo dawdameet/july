@@ -1,65 +1,60 @@
-update on July (distributed C execution engine across LAN).
+July: distributed C execution engine across LAN.
 
-the devlog was getting too long, so here’s the tl;dr in Q&A:
+devlog in Q&A:
 
 what is it?
 > turns any spare linux box on your LAN into ambient compute in milliseconds.
 
 how fast?
-> shipped a full C repo over Wi-Fi, compiled with gcc -O3, ran 4 threads, and downloaded the binary back in 580 ms total.
-> latency budget: 2 ms RAM pack, 3 ms Wi-Fi transfer, 3 ms tmpfs unpack, 420 ms GCC compile, 51 ms CPU run, 10 ms sendfile() DMA return. orchestration overhead is ~80 ms.
+> shipped a C repo over Wi-Fi, compiled with gcc -O3, ran 4 threads, got the binary back in 580 ms.
+> breakdown: 2 ms pack, 3 ms transfer, 3 ms tmpfs unpack, 420 ms gcc, 51 ms run, 10 ms sendfile() DMA (orchestration: ~80 ms).
 
 why not docker / ssh?
-> no container daemon, no layer caching delays, no ssh negotiation (which takes 300-800 ms alone). 
-> packs files into RAM in 2 ms, sends raw memory-aligned envelope (0x4A554C59 header), unpacks straight into tmpfs (RAM disk).
+> no daemon, no layer cache lag, no 300-800 ms ssh handshake.
+> packs in RAM in 2 ms, sends raw memory-aligned envelope (0x4A554C59 header), unpacks into tmpfs.
 
 auth?
-> 0-RTT header check (X-July-Token). no token = instant 401 Unauthorized. neighbors on Wi-Fi cannot mine crypto.
+> 0-RTT header check (X-July-Token). no token = instant 401. neighbors can't mine crypto.
 
 security?
-> linux kernel namespaces (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNET).
-> offline loopback mode by default (builds cannot phone home or scan LAN) + memory ceiling via RLIMIT_DATA.
+> linux kernel namespaces (CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNET loopback-only). builds can't phone home or scan LAN + RLIMIT_DATA memory cap.
 
 how tcp session not adding ms?
-> interactive ambient console (`july>`) holds a single warm TCP connection pool.
-> fire tasks with zero handshake delay. close laptop lid = clean disconnect.
+> ambient console (`july>`) keeps a warm TCP pipe open. 0 ms handshake delay. close laptop lid = clean exit.
 
-numbers on warm vs cold tcp shootout?
-> 2,000 requests over Wi-Fi (20 concurrent threads):
-> • throughput: 1,929 req/s (warm) vs 833 req/s (cold) — 2.32x faster
-> • avg latency: 9.54 ms vs 23.81 ms — 60% lower
-> • p50 latency: 8.89 ms vs 18.90 ms — 53% lower
-> • p95 latency: 14.91 ms vs 34.57 ms — 57% lower
-> • p99 latency: 21.65 ms vs 304.71 ms — 14x better tail latency
-> cold connections get destroyed by TCP SYN queues and TIME_WAIT ephemeral socket exhaustion.
+warm vs cold tcp shootout?
+> 2,000 requests over Wi-Fi (20 threads):
+> • throughput: 1,929 vs 833 req/s (2.32x faster)
+> • avg latency: 9.54 vs 23.81 ms (60% lower)
+> • p50: 8.89 vs 18.90 ms | p95: 14.91 vs 34.57 ms
+> • p99 tail: 21.65 vs 304.71 ms (14x better)
+> cold conns get trashed by TCP SYN queues & TIME_WAIT socket churn.
 
-what about sustained stress bombardment?
-> hammered with 50 concurrent connections over 10 seconds:
-> • 27,618 requests handled in 10s
-> • 2,762 req/s sustained throughput (peaking at 4,045 req/s)
-> • 100% 202 Accepted status codes
-> • 0 timeouts, 0 dropped sockets, 0 errors
+sustained stress test?
+> 50 concurrent connections over 10s:
+> • 27,618 requests in 10s (2,762 req/s sustained, 4,045 peak)
+> • 100% 202 Accepted, 0 errors, 0 dropped sockets.
 
-downloading compiled artifacts?
-> zero user-space copying. linux kernel `sendfile()` streams page cache straight into socket TX buffers via DMA.
+downloading artifacts?
+> zero-copy DMA. linux kernel `sendfile()` streams page cache straight to socket TX buffers.
 
-concurrency under real compute load?
-> fired 5 distinct workloads in parallel (make -j5):
-> • 16-shard in-memory key-value store logging 100k txns to binary WAL @ 1.72M ops/sec
-> • 512x512 block-tiled matrix multiplication @ 7.62 GFLOPS
-> • C tick generator + Python 3 stream analytics @ 1.27M ticks/sec (7.25 MB binary stream)
-> • multithreaded prime telemetry + kernel sandbox verification
-> pegged all Linux cores to 100%, ran 3 GCC compilers simultaneously in tmpfs, and streamed ~8.5 MB of binaries back to Mac in 3.2 seconds.
+concurrency under load?
+> fired 5 workloads in parallel (make -j5):
+> • 16-shard KV store: 100k txns to binary WAL @ 1.72M ops/s
+> • 512x512 matrix multiply: 7.62 GFLOPS
+> • C ticks + Python 3 analytics: 1.27M ticks/s (7.25 MB stream)
+> • multithreaded prime telemetry + kernel sandbox test
+> pegged all cores to 100%, 3 GCC builds in tmpfs, streamed ~8.5 MB back in 3.2s.
 
 what it means for you?
-> your laptop stays dead cool and silent. zero fan noise, zero battery drain from heavy builds, tests, or background container daemons.
-> write code on your workstation (even macOS ARM64), compile & test against native Linux kernel primitives in under 600 ms without running heavy VMs.
-> no SSH keys to juggle, no rsync lag, no Dockerfiles to maintain. that idle box in the corner becomes an invisible extension of your terminal.
+> laptop stays cool and silent. zero fan noise or battery drain from builds and test suites.
+> code on macOS ARM64, compile & test native x86_64 Linux in <600 ms without heavy VMs.
+> no SSH keys, no rsync lag, no Dockerfiles. the idle box in the corner is an ambient extension of your terminal.
 
-machine specs (for reproducible numbers)?
-> client (dispatcher): Apple MacBook (Apple M1, 8 GB RAM, macOS)
-> worker (remote node): Intel Core i3-1005G1 (2C/4T @ 1.20GHz, 3.40GHz boost), Fedora Linux 40 (x86_64, Kernel 6.8+), tmpfs RAM disk
-> network: consumer home Wi-Fi (LAN, 192.168.1.41:8080, ~2-3 ms baseline ping)
-> compiler: gcc (GCC) 14.x with -O3 -pthread -mavx2
+specs (for reproducibility):
+> client: Apple M1 MacBook Air (8 GB, macOS)
+> worker: Intel i3-1005G1 (2C/4T @ 1.2GHz), Fedora 40 (x86_64, Linux 6.8+), tmpfs
+> network: consumer home Wi-Fi (~2-3 ms ping)
+> compiler: gcc 14 (-O3 -pthread -mavx2)
 
 code: https://github.com/dawdameet/july
