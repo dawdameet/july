@@ -88,9 +88,19 @@ test-sandbox: dispatcher
 	@cat tests/05_sandbox_rich/sandbox_report.json
 	@echo "\n[✓] Sandbox Isolation Test Passed!"
 
-test-all: test-sysbench test-matrix test-kv test-pipeline test-sandbox
+test-sync: dispatcher
+	@echo "================================================================="
+	@echo " [6/6] Dispatching Persistent Project Workspace & Delta Sync"
+	@echo " Target: $(TARGET)"
+	@echo "================================================================="
+	cd tests/06_codebase_sync && ../../dispatcher $(TARGET) build
+	@echo "\n[*] Artifact Check:"
+	@file tests/06_codebase_sync/sync_app
+	@echo "\n[✓] Project Workspace & Delta Sync Test Passed!"
+
+test-all: test-sysbench test-matrix test-kv test-pipeline test-sandbox test-sync
 	@echo "\n================================================================="
-	@echo "       [✓] ALL 5 REMOTE LINUX APPLICATIONS PASSED!               "
+	@echo "       [✓] ALL 6 REMOTE LINUX APPLICATIONS PASSED!               "
 	@echo "================================================================="
 
 clean:
@@ -100,5 +110,7 @@ clean:
 	rm -f tests/03_kv_storage/kv_engine tests/03_kv_storage/wal.bin tests/03_kv_storage/kv_report.json
 	rm -f tests/04_data_pipeline/tick_gen tests/04_data_pipeline/ticks.bin tests/04_data_pipeline/analytics_summary.json
 	rm -f tests/sys_bench tests/benchmark_report.json
+	rm -f tests/06_codebase_sync/sync_app tests/06_codebase_sync/*.o
+	rm -rf tests/06_codebase_sync/.july
 
-.PHONY: all test test-sysbench test-matrix test-kv test-pipeline test-all clean
+.PHONY: all test test-sysbench test-matrix test-kv test-pipeline test-sandbox test-sync test-all clean

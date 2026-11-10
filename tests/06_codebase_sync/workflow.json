@@ -1,0 +1,14 @@
+{
+  "name": "codebase-sync-shootout",
+  "build": [
+    "make clean",
+    "make -j4",
+    "./sync_app"
+  ],
+  "artifacts": {
+    "required": [
+      "sync_app"
+    ]
+  }
+}
+

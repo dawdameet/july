@@ -652,6 +652,12 @@ int execute_workflow_task(const Task *task)
     }
     free(env_data);
 
+    if (manifest.is_workspace)
+    {
+        safe_copy_str(sandbox_dir, sizeof(sandbox_dir), manifest.workspace_dir);
+        dprintf(log_fd, "[Workspace] Persistent workspace active: %s\n", sandbox_dir);
+    }
+
     dprintf(log_fd, "=== July Workflow: %s (Task ID: %s) ===\n", manifest.name, task->taskId);
     if (manifest.sandbox_memory_mb > 0 || manifest.sandbox_max_pids > 0 || manifest.sandbox_namespace || !manifest.sandbox_network)
     {
@@ -740,7 +746,9 @@ finish_workflow:
             snprintf(dst_path, sizeof(dst_path), "%s/%s", artifacts_dir, art);
 
             mkdir_p_parent(dst_path);
-            if (rename(src_path, dst_path) == 0 || copy_file(src_path, dst_path) == 0)
+            int staged = manifest.is_workspace ? copy_file(src_path, dst_path) :
+                         (rename(src_path, dst_path) == 0 ? 0 : copy_file(src_path, dst_path));
+            if (staged == 0)
             {
                 struct stat ast;
                 stat(dst_path, &ast);
@@ -763,7 +771,9 @@ finish_workflow:
             snprintf(dst_path, sizeof(dst_path), "%s/%s", artifacts_dir, art);
 
             mkdir_p_parent(dst_path);
-            if (rename(src_path, dst_path) == 0 || copy_file(src_path, dst_path) == 0)
+            int staged = manifest.is_workspace ? copy_file(src_path, dst_path) :
+                         (rename(src_path, dst_path) == 0 ? 0 : copy_file(src_path, dst_path));
+            if (staged == 0)
             {
                 struct stat ast;
                 stat(dst_path, &ast);
@@ -797,11 +807,14 @@ finish_workflow:
         fclose(mf);
     }
 
-    // Phase 6: Clean up ephemeral sandbox directory
-    char rm_cmd[1024];
-    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", sandbox_dir);
-    if (system(rm_cmd) != 0) {
-        // Log cleanup warning if needed
+    // Phase 6: Clean up ephemeral sandbox directory (preserve persistent workspace)
+    if (!manifest.is_workspace)
+    {
+        char rm_cmd[1024];
+        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", sandbox_dir);
+        if (system(rm_cmd) != 0) {
+            // Log cleanup warning if needed
+        }
     }
 
     // Read log snippet into TaskResultStore

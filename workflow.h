@@ -15,6 +15,12 @@
 #define JULY_ENVELOPE_MAGIC   0x4A554C59 // "JULY" in ASCII
 #define JULY_ENVELOPE_VERSION 1
 
+// Envelope flags (offset +6, uint16_t)
+#define JULY_FLAG_NONE        0x0000
+#define JULY_FLAG_WORKSPACE   0x0001 // Use persistent workspace /tmp/july_workspaces/<project>
+#define JULY_FLAG_DELTA       0x0002 // Incremental delta update (overlay dirty files)
+#define JULY_FLAG_CLEAN       0x0004 // Clean build (wipe workspace before unpack)
+
 #define MAX_WORKFLOW_NAME 128
 #define MAX_GITHUB_LINK 512
 #define MAX_TOOLS 32
@@ -64,6 +70,11 @@ typedef struct {
 
     int num_failure_artifacts;
     char failure_artifacts[MAX_ARTIFACTS][MAX_PATH_LEN];
+
+    // Project workspace mode
+    bool is_workspace;
+    bool is_clean;
+    char workspace_dir[MAX_PATH_LEN];
 } WorkflowManifest;
 
 /* ---------------- Little-Endian Helpers ---------------- */
@@ -514,6 +525,47 @@ static inline int unpack_envelope(const uint8_t *data, size_t total_len,
     if (parse_workflow_manifest(manifest_json, manifest_len, out_manifest) != 0)
         return -1;
 
+    uint16_t flags = read_uint16_le(data + 6);
+    out_manifest->is_workspace = (flags & JULY_FLAG_WORKSPACE) != 0;
+    out_manifest->is_clean = (flags & JULY_FLAG_CLEAN) != 0;
+
+    char target_dir[MAX_PATH_LEN];
+    if (out_manifest->is_workspace && out_manifest->name[0] != '\0')
+    {
+        char safe_name[MAX_WORKFLOW_NAME];
+        size_t sidx = 0;
+        for (size_t k = 0; out_manifest->name[k] && sidx < sizeof(safe_name) - 1; k++)
+        {
+            char c = out_manifest->name[k];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-')
+            {
+                safe_name[sidx++] = c;
+            }
+        }
+        safe_name[sidx] = '\0';
+        if (safe_name[0] == '\0')
+            safe_copy_str(safe_name, sizeof(safe_name), "default_project");
+
+        snprintf(target_dir, sizeof(target_dir), "/tmp/july_workspaces/%s", safe_name);
+        safe_copy_str(out_manifest->workspace_dir, sizeof(out_manifest->workspace_dir), target_dir);
+
+        if (out_manifest->is_clean)
+        {
+            char clean_cmd[1100];
+            snprintf(clean_cmd, sizeof(clean_cmd), "rm -rf %s", target_dir);
+            int ret = system(clean_cmd);
+            (void)ret;
+        }
+        mkdir_p(target_dir);
+    }
+    else
+    {
+        safe_copy_str(target_dir, sizeof(target_dir), sandbox_dir);
+        safe_copy_str(out_manifest->workspace_dir, sizeof(out_manifest->workspace_dir), sandbox_dir);
+        mkdir_p(target_dir);
+    }
+
     uint32_t num_files = read_uint32_le(data + 12 + manifest_len);
     const uint8_t *p = data + 12 + manifest_len + 4;
     const uint8_t *end = data + total_len;
@@ -542,7 +594,7 @@ static inline int unpack_envelope(const uint8_t *data, size_t total_len,
         if (p + file_len > end) return -1;
 
         char dest_path[1024];
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", sandbox_dir, rel_path);
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", target_dir, rel_path);
         mkdir_p_parent(dest_path);
 
         int fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, mode ? (mode_t)mode : 0644);

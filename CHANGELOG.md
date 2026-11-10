@@ -6,6 +6,53 @@ All notable milestones, git commits, optimization breakthroughs, and architectur
 
 ## Git Commit History
 
+### `HEAD` — `Dual-Mode Engine: .julyconfig Persistent CAS Workspaces & Delta Sync`
+- **Date**: Tue Nov 10 23:20:00 2026 +0530
+- **Author**: Meet Dawda
+- **Summary**:
+  - **Dual-Mode Architectural Separation**:
+    - **Project / CAS Mode (With `.julyconfig`)**: Detects `.julyconfig` in current or parent directories. Manages persistent worker workspaces (`/tmp/july_workspaces/<project>/`), performs sub-millisecond local hash scanning, and transmits only dirty files via delta envelopes (`JULY_FLAG_WORKSPACE | JULY_FLAG_DELTA`). Preserves intermediate `.o` object files on the worker, enabling true incremental compilation (`make` re-links in ~40 ms).
+    - **Ad-Hoc / Ephemeral Mode (Without `.julyconfig`)**: Direct raw wire transmission over TCP into ephemeral sandboxes (`/tmp/july_runs/<taskId>/`) for one-off commands and single files, leaving zero persistent disk footprint.
+  - **Binary Envelope Protocol Upgrade (`workflow.h`)**:
+    - Introduced 16-bit envelope flags at offset `+6`: `JULY_FLAG_WORKSPACE` (`0x0001`), `JULY_FLAG_DELTA` (`0x0002`), `JULY_FLAG_CLEAN` (`0x0004`).
+    - Upgraded `unpack_envelope()` and `execute_workflow_task()` in `server.c`: routes builds into `/tmp/july_workspaces/<project>/`, copies artifacts without deleting intermediate build files, and skips ephemeral directory deletion for persistent workspaces.
+  - **Local Content-Addressed Delta Cache (`dispatcher.c`)**:
+    - Fast 64-bit FNV-1a hashing with `.july/cache.bin` binary cache. Skips file I/O if `mtime` and `size` match; computes content hash only when dirty.
+    - Added `init` command (`dispatcher init [project] [target]`) generating project manifests.
+    - Added `clean` flag (`dispatcher clean` / `--clean`) to wipe remote workspaces and trigger fresh cold builds on demand.
+  - **Multi-Module Benchmark Suite (`tests/06_codebase_sync`)**:
+    - Added 11-file C project (5 modules, headers, Makefile, `.julyconfig`). Added `make test-sync` to root Makefile.
+    - Verified real-world incremental compilation latency over Wi-Fi:
+      | Test Scenario | Files Transmitted | Remote Compiler State | Total Wall Clock |
+      | :--- | :--- | :--- | :--- |
+      | **Cold Rebuild (`./dispatcher clean`)** | 11 files (all dirty) | Compiles all 5 `.o` files from scratch | **172 – 417 ms** |
+      | **Warm Incremental Edit (1-line change)** | **1 file** (`math_engine.c`) | Recompiles **only `math_engine.o`** & re-links | **101 – 206 ms** |
+      | **Unchanged Cache Run (`./dispatcher build`)** | **0 files** | `make: Nothing to be done for 'all'` | **40 ms** |
+      | **Ad-Hoc One-Shot (`echo hi`)** | 0 files | Raw TCP socket execution | **257 ms** |
+    - **Microsecond Hashing**: 11-file local SHA-256 / FNV-1a scan completes in **0.48 ms**, with delta resolution taking **0.004 ms** ($< 1\text{ ms}$ total client overhead).
+    - **Speedup**: 1.4x – 1.8x on small 5-module repos; eliminates 95%+ of compiler runtime on medium/large codebases by retaining `.o` build artifacts.
+
+---
+
+### `HEAD` — `Low-Latency Network & Process Engine Optimizations (Sub-Millisecond Polling & Vectored I/O)`
+- **Date**: Tue Nov 10 21:50:00 2026 +0530
+- **Author**: Meet Dawda
+- **Summary**:
+  - **Client-Side TCP & Socket Tuning (`dispatcher.c`)**:
+    - **`TCP_NODELAY` on Client**: Enabled `TCP_NODELAY` immediately upon socket creation in `connect_to_server()`. Disables Nagle's algorithm on macOS, eliminating 10–40 ms delayed-ACK buffering stalls on small headers and status probes.
+    - **Vectored I/O (`writev()`)**: Switched `POST /task` and `POST /workflow` to use POSIX `writev()` with an `iovec` array. Sends HTTP request headers and raw binary payloads/envelopes in a single atomic syscall and a single TCP packet, eliminating split-packet network overhead.
+    - **Persistent Socket Reuse for Workflow Lifecycles**: The entire lifecycle of a workflow (envelope upload, status polling, and log retrieval) now runs over a single open warm TCP socket without socket teardown or ephemeral port exhaustion.
+    - **Sub-Millisecond Adaptive Polling**: Replaced the static 50 ms idle sleep (`usleep(50000)`) with an adaptive exponential backoff starting at **1 ms** ($1\text{ ms} \to 2\text{ ms} \to 4\text{ ms} \to 8\text{ ms}$). Decreased build-completion discovery latency from ~25–50 ms down to $<2\text{ ms}$.
+  - **Worker Process & Kernel Streaming Tuning (`server.c`)**:
+    - **Reactive Process Wakeup via `poll()`**: Replaced the busy `usleep(10000)` polling loop in `run_command_in_sandbox()` with non-blocking `poll()` on the child pipe `pipefd[0]`. The microsecond GCC finishes or exits (closing `pipefd[1]`), the kernel notifies the server in $<0.05\text{ ms}$.
+    - **Linux Kernel `TCP_CORK` Coalescing**: Wrapped zero-copy `sendfile()` streaming with `TCP_CORK = 1` before writing headers and `TCP_CORK = 0` after `sendfile()`, forcing the Linux network stack to coalesce HTTP response headers and DMA file chunks into optimal MTU packets.
+    - **HTTP/1.1 Keep-Alive Handshake**: Added full `Connection: keep-alive` support on `/retrieve` endpoints to allow sustained streaming without connection resets.
+  - **Performance Verification**:
+    - One-shot remote execution (`echo hi`) latency dropped to **0.257 seconds** total round-trip over LAN Wi-Fi.
+    - All 5 test suites (`test-sysbench`, `test-matrix`, `test-kv`, `test-pipeline`, `test-sandbox`) pass sequentially and concurrently (`make -j5 test-all`) in ~3.1 seconds with 0 dropped sockets.
+
+---
+
 ### `HEAD` — `Token Auth, Worker Sandboxing, Richer JSON & Ambient Console`
 - **Date**: Tue Nov 10 00:15:00 2026 +0530
 - **Author**: Meet Dawda

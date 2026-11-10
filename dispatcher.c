@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/uio.h>
+#include <dirent.h>
+#include <fnmatch.h>
 
 #include "task.h"
 #include "workflow.h"
@@ -632,61 +634,11 @@ __attribute__((unused)) static int download_artifact(const char *host, int port,
     return download_artifact_conn(NULL, host, port, task_id, artifact_name);
 }
 
-/* Dispatch binary multi-file envelope workflow */
-static int dispatch_workflow(const char *host, int port, const char *manifest_file,
-                             int num_files, char **files, int timeout_sec)
+/* Dispatch raw binary multi-file envelope */
+static int dispatch_envelope(const char *host, int port, const char *manifest_json, size_t mlen,
+                             const WorkflowManifest *manifest, int num_files, const char **files,
+                             uint16_t envelope_flags, int timeout_sec)
 {
-    printf("%s[+] Packing workflow container...%s\n",
-           use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
-    printf("%s    • Manifest file: %s%s\n",
-           use_colors ? COLOR_CYAN : "", manifest_file, use_colors ? COLOR_RESET : "");
-    printf("%s    • Bundled files: %d%s\n",
-           use_colors ? COLOR_CYAN : "", num_files, use_colors ? COLOR_RESET : "");
-
-    FILE *mf = fopen(manifest_file, "rb");
-    if (!mf)
-    {
-        fprintf(stderr, "%s[!] Cannot open manifest file '%s': %s%s\n",
-                use_colors ? COLOR_RED : "", manifest_file, strerror(errno), use_colors ? COLOR_RESET : "");
-        return 1;
-    }
-    fseek(mf, 0, SEEK_END);
-    long mlen = ftell(mf);
-    fseek(mf, 0, SEEK_SET);
-    char *manifest_json = malloc(mlen + 1);
-    if (!manifest_json)
-    {
-        fclose(mf);
-        return 1;
-    }
-    if (fread(manifest_json, 1, mlen, mf) != (size_t)mlen)
-    {
-        fclose(mf);
-        free(manifest_json);
-        return 1;
-    }
-    manifest_json[mlen] = '\0';
-    fclose(mf);
-
-    WorkflowManifest manifest;
-    if (parse_workflow_manifest(manifest_json, mlen, &manifest) != 0)
-    {
-        fprintf(stderr, "%s[!] Failed to parse JSON manifest in '%s'%s\n",
-                use_colors ? COLOR_RED : "", manifest_file, use_colors ? COLOR_RESET : "");
-        free(manifest_json);
-        return 1;
-    }
-
-    if (timeout_sec <= 0)
-        timeout_sec = manifest.timeout_sec > 0 ? manifest.timeout_sec : DEFAULT_TIMEOUT_SEC;
-
-    printf("%s    • Workflow Name: %s%s\n",
-           use_colors ? COLOR_GREEN : "", manifest.name, use_colors ? COLOR_RESET : "");
-    printf("%s    • Pre-flight Probe: %d tool(s) | Dependencies: %d | Build Steps: %d%s\n",
-           use_colors ? COLOR_GREEN : "", manifest.num_check_tools, manifest.num_deps, manifest.num_build_cmds, use_colors ? COLOR_RESET : "");
-    printf("%s    • Required Artifacts: %d%s\n",
-           use_colors ? COLOR_GREEN : "", manifest.num_required_artifacts, use_colors ? COLOR_RESET : "");
-
     // Calculate binary envelope size
     size_t envelope_size = 12 + mlen + 4;
     for (int i = 0; i < num_files; i++)
@@ -696,7 +648,6 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         {
             fprintf(stderr, "%s[!] Source file not found: '%s'%s\n",
                     use_colors ? COLOR_RED : "", files[i], use_colors ? COLOR_RESET : "");
-            free(manifest_json);
             return 1;
         }
         size_t path_len = strlen(files[i]);
@@ -704,7 +655,6 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         {
             fprintf(stderr, "%s[!] File path too long: '%s'%s\n",
                     use_colors ? COLOR_RED : "", files[i], use_colors ? COLOR_RESET : "");
-            free(manifest_json);
             return 1;
         }
         envelope_size += 2 + path_len + 2 + 8 + (size_t)st.st_size;
@@ -714,7 +664,6 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     if (!envelope)
     {
         perror("malloc envelope");
-        free(manifest_json);
         return 1;
     }
 
@@ -724,7 +673,7 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     envelope[2] = 'L';
     envelope[3] = 'Y';
     write_uint16_le(envelope + 4, JULY_ENVELOPE_VERSION);
-    write_uint16_le(envelope + 6, 0); // flags
+    write_uint16_le(envelope + 6, envelope_flags); // flags: workspace, delta, clean
     write_uint32_le(envelope + 8, (uint32_t)mlen);
     memcpy(envelope + 12, manifest_json, mlen);
     write_uint32_le(envelope + 12 + mlen, (uint32_t)num_files);
@@ -753,13 +702,13 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         {
             if (st.st_size > 0)
             {
-                read(fd, p, (size_t)st.st_size);
+                ssize_t rd = read(fd, p, (size_t)st.st_size);
+                (void)rd;
             }
             close(fd);
         }
         p += st.st_size;
     }
-    free(manifest_json);
 
     printf("%s[+] Connecting to %s:%d...%s\n",
            use_colors ? COLOR_BLUE : "", host, port, use_colors ? COLOR_RESET : "");
@@ -876,11 +825,11 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     }
 
     printf("%s[✓] Workflow '%s' enqueued successfully! (Task ID: %s)%s\n",
-           use_colors ? COLOR_GREEN : "", manifest.name, task_id, use_colors ? COLOR_RESET : "");
+           use_colors ? COLOR_GREEN : "", manifest->name, task_id, use_colors ? COLOR_RESET : "");
     printf("%s[*] Streaming execution logs from server OS Page Cache...%s\n\n",
            use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
 
-    // Keep the warm connection open for status polling and artifact download!
+    // Keep the warm connection open for status polling
     int poll_sock = sock;
     useconds_t poll_sleep_us = 1000; // start at 1ms sub-millisecond adaptive backoff
 
@@ -897,20 +846,14 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         int res = retrieve_task_conn(&poll_sock, host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
         if (res == 0)
         {
-            // Completed!
             break;
         }
-        else if (res == 1) // 202 Still running
+        else if (res == 1 || res == -2) // 202 Still running or 404
         {
             usleep(poll_sleep_us);
             if (poll_sleep_us < 8000) poll_sleep_us *= 2;
         }
-        else if (res == -2) // 404
-        {
-            usleep(poll_sleep_us);
-            if (poll_sleep_us < 8000) poll_sleep_us *= 2;
-        }
-        else if (res < 0)
+        else
         {
             fprintf(stderr, "%s[!] Network error retrieving workflow status%s\n",
                     use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
@@ -939,7 +882,6 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         free(log_output);
     }
 
-    // Close poll socket after log retrieval is complete
     if (poll_sock >= 0)
     {
         close(poll_sock);
@@ -956,15 +898,15 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     printf("\n%s[✓] Workflow Completed Successfully (Exit Code: 0)!%s\n",
            use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "");
 
-    // Stage 5: Zero-copy artifact retrieval
-    if (manifest.num_required_artifacts > 0)
+    // Zero-copy artifact retrieval
+    if (manifest->num_required_artifacts > 0)
     {
         printf("%s[*] Downloading %d required artifact(s) via zero-copy sendfile()...%s\n",
-               use_colors ? COLOR_CYAN : "", manifest.num_required_artifacts, use_colors ? COLOR_RESET : "");
+               use_colors ? COLOR_CYAN : "", manifest->num_required_artifacts, use_colors ? COLOR_RESET : "");
 
-        for (int i = 0; i < manifest.num_required_artifacts; i++)
+        for (int i = 0; i < manifest->num_required_artifacts; i++)
         {
-            const char *art = manifest.required_artifacts[i];
+            const char *art = manifest->required_artifacts[i];
             printf("%s    ➔ Downloading '%s'...%s ",
                    use_colors ? COLOR_BLUE : "", art, use_colors ? COLOR_RESET : "");
             fflush(stdout);
@@ -987,24 +929,632 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
     return 0;
 }
 
+/* Dispatch binary multi-file envelope workflow */
+static int dispatch_workflow(const char *host, int port, const char *manifest_file,
+                             int num_files, char **files, int timeout_sec)
+{
+    printf("%s[+] Packing workflow container...%s\n",
+           use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
+    printf("%s    • Manifest file: %s%s\n",
+           use_colors ? COLOR_CYAN : "", manifest_file, use_colors ? COLOR_RESET : "");
+    printf("%s    • Bundled files: %d%s\n",
+           use_colors ? COLOR_CYAN : "", num_files, use_colors ? COLOR_RESET : "");
+
+    FILE *mf = fopen(manifest_file, "rb");
+    if (!mf)
+    {
+        fprintf(stderr, "%s[!] Cannot open manifest file '%s': %s%s\n",
+                use_colors ? COLOR_RED : "", manifest_file, strerror(errno), use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+    fseek(mf, 0, SEEK_END);
+    long mlen = ftell(mf);
+    fseek(mf, 0, SEEK_SET);
+    char *manifest_json = malloc(mlen + 1);
+    if (!manifest_json)
+    {
+        fclose(mf);
+        return 1;
+    }
+    if (fread(manifest_json, 1, mlen, mf) != (size_t)mlen)
+    {
+        fclose(mf);
+        free(manifest_json);
+        return 1;
+    }
+    manifest_json[mlen] = '\0';
+    fclose(mf);
+
+    WorkflowManifest manifest;
+    if (parse_workflow_manifest(manifest_json, mlen, &manifest) != 0)
+    {
+        fprintf(stderr, "%s[!] Failed to parse JSON manifest in '%s'%s\n",
+                use_colors ? COLOR_RED : "", manifest_file, use_colors ? COLOR_RESET : "");
+        free(manifest_json);
+        return 1;
+    }
+
+    if (timeout_sec <= 0)
+        timeout_sec = manifest.timeout_sec > 0 ? manifest.timeout_sec : DEFAULT_TIMEOUT_SEC;
+
+    printf("%s    • Workflow Name: %s%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.name, use_colors ? COLOR_RESET : "");
+    printf("%s    • Pre-flight Probe: %d tool(s) | Dependencies: %d | Build Steps: %d%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.num_check_tools, manifest.num_deps, manifest.num_build_cmds, use_colors ? COLOR_RESET : "");
+    printf("%s    • Required Artifacts: %d%s\n",
+           use_colors ? COLOR_GREEN : "", manifest.num_required_artifacts, use_colors ? COLOR_RESET : "");
+
+    int ret = dispatch_envelope(host, port, manifest_json, (size_t)mlen, &manifest,
+                                num_files, (const char **)files, JULY_FLAG_NONE, timeout_sec);
+    free(manifest_json);
+    return ret;
+}
+
+/* ---------------- Project Workspace & CAS Engine ---------------- */
+
+typedef struct {
+    char project[MAX_WORKFLOW_NAME];
+    char target[256];
+    int num_build_cmds;
+    char build_cmds[MAX_BUILD_CMDS][MAX_CMD_LEN];
+    int num_artifacts;
+    char artifacts[MAX_ARTIFACTS][MAX_PATH_LEN];
+    int num_ignores;
+    char ignores[32][64];
+} JulyProjectConfig;
+
+#define MAX_PROJECT_FILES 2048
+#define JULY_CACHE_MAGIC  0x4A434143 // "JCAC"
+
+typedef struct {
+    char rel_path[MAX_PATH_LEN];
+    uint64_t mtime;
+    uint64_t size;
+    uint64_t hash;
+} ProjectCacheEntry;
+
+static int parse_julyconfig(const char *json, size_t len, JulyProjectConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    safe_copy_str(cfg->project, sizeof(cfg->project), "project");
+    safe_copy_str(cfg->target, sizeof(cfg->target), "127.0.0.1:8080");
+
+    // Default ignores
+    safe_copy_str(cfg->ignores[0], sizeof(cfg->ignores[0]), ".git*");
+    safe_copy_str(cfg->ignores[1], sizeof(cfg->ignores[1]), "*.o");
+    safe_copy_str(cfg->ignores[2], sizeof(cfg->ignores[2]), ".july*");
+    safe_copy_str(cfg->ignores[3], sizeof(cfg->ignores[3]), "*.dSYM");
+    safe_copy_str(cfg->ignores[4], sizeof(cfg->ignores[4]), ".DS_Store");
+    cfg->num_ignores = 5;
+
+    const char *p = json;
+    const char *end = json + len;
+
+    p = skip_json_ws(p, end);
+    if (p >= end || *p != '{') return -1;
+    p++;
+
+    while (p < end)
+    {
+        p = skip_json_ws(p, end);
+        if (p < end && *p == '}') { p++; break; }
+
+        char key[64];
+        if (!parse_json_string(&p, end, key, sizeof(key))) break;
+        p = skip_json_ws(p, end);
+        if (p >= end || *p != ':') break;
+        p++;
+        p = skip_json_ws(p, end);
+
+        if (strcmp(key, "project") == 0 || strcmp(key, "name") == 0)
+        {
+            parse_json_string(&p, end, cfg->project, sizeof(cfg->project));
+        }
+        else if (strcmp(key, "target") == 0)
+        {
+            parse_json_string(&p, end, cfg->target, sizeof(cfg->target));
+        }
+        else if (strcmp(key, "build") == 0)
+        {
+            if (p < end && *p == '[')
+            {
+                char tmp[MAX_BUILD_CMDS][MAX_CMD_LEN];
+                int cnt = 0;
+                parse_json_string_array(&p, end, tmp, &cnt, MAX_BUILD_CMDS);
+                cfg->num_build_cmds = cnt;
+                for (int i = 0; i < cnt; i++)
+                    safe_copy_str(cfg->build_cmds[i], sizeof(cfg->build_cmds[i]), tmp[i]);
+            }
+            else
+            {
+                char cmd[MAX_CMD_LEN];
+                if (parse_json_string(&p, end, cmd, sizeof(cmd)))
+                {
+                    safe_copy_str(cfg->build_cmds[0], sizeof(cfg->build_cmds[0]), cmd);
+                    cfg->num_build_cmds = 1;
+                }
+            }
+        }
+        else if (strcmp(key, "artifacts") == 0)
+        {
+            if (p < end && *p == '[')
+            {
+                char tmp[MAX_ARTIFACTS][MAX_CMD_LEN];
+                int cnt = 0;
+                parse_json_string_array(&p, end, tmp, &cnt, MAX_ARTIFACTS);
+                cfg->num_artifacts = cnt;
+                for (int i = 0; i < cnt; i++)
+                    safe_copy_str(cfg->artifacts[i], sizeof(cfg->artifacts[i]), tmp[i]);
+            }
+        }
+        else if (strcmp(key, "ignore") == 0)
+        {
+            if (p < end && *p == '[')
+            {
+                char tmp[32][MAX_CMD_LEN];
+                int cnt = 0;
+                parse_json_string_array(&p, end, tmp, &cnt, 32);
+                for (int i = 0; i < cnt && cfg->num_ignores < 32; i++)
+                    safe_copy_str(cfg->ignores[cfg->num_ignores++], sizeof(cfg->ignores[0]), tmp[i]);
+            }
+        }
+        else
+        {
+            p = skip_json_value(p, end);
+        }
+
+        p = skip_json_ws(p, end);
+        if (p < end && *p == ',') p++;
+    }
+    return 0;
+}
+
+static bool find_julyconfig(char *out_path, size_t max_len)
+{
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof(cwd))) return false;
+
+    char curr[1024];
+    safe_copy_str(curr, sizeof(curr), cwd);
+
+    while (curr[0] != '\0')
+    {
+        char probe[1024];
+        snprintf(probe, sizeof(probe), "%s/.julyconfig", curr);
+        if (access(probe, R_OK) == 0)
+        {
+            safe_copy_str(out_path, max_len, probe);
+            return true;
+        }
+
+        char *last_slash = strrchr(curr, '/');
+        if (!last_slash || last_slash == curr) break;
+        *last_slash = '\0';
+    }
+    return false;
+}
+
+static int init_july_project(const char *project_name, const char *target)
+{
+    if (access(".julyconfig", F_OK) == 0)
+    {
+        fprintf(stderr, "%s[!] .julyconfig already exists in this directory!%s\n",
+                use_colors ? COLOR_YELLOW : "", use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+
+    char def_name[64] = "my_project";
+    if (project_name && project_name[0] != '\0')
+    {
+        safe_copy_str(def_name, sizeof(def_name), project_name);
+    }
+    else
+    {
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd)))
+        {
+            char *base = strrchr(cwd, '/');
+            if (base && base[1] != '\0')
+                safe_copy_str(def_name, sizeof(def_name), base + 1);
+        }
+    }
+
+    char def_target[256];
+    safe_copy_str(def_target, sizeof(def_target), target ? target : "192.168.1.41:8080");
+
+    FILE *f = fopen(".julyconfig", "w");
+    if (!f)
+    {
+        perror("fopen .julyconfig");
+        return 1;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"project\": \"%s\",\n", def_name);
+    fprintf(f, "  \"target\": \"%s\",\n", def_target);
+    fprintf(f, "  \"build\": [\n");
+    fprintf(f, "    \"make -j4\"\n");
+    fprintf(f, "  ],\n");
+    fprintf(f, "  \"artifacts\": [\n");
+    fprintf(f, "    \"app\"\n");
+    fprintf(f, "  ],\n");
+    fprintf(f, "  \"ignore\": [\n");
+    fprintf(f, "    \".git*\",\n");
+    fprintf(f, "    \"*.o\",\n");
+    fprintf(f, "    \".july*\",\n");
+    fprintf(f, "    \"*.dSYM\",\n");
+    fprintf(f, "    \".DS_Store\"\n");
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+    fclose(f);
+
+    mkdir(".july", 0755);
+    FILE *gi = fopen(".july/.gitignore", "w");
+    if (gi)
+    {
+        fprintf(gi, "*\n");
+        fclose(gi);
+    }
+
+    printf("%s[✓] Initialized July project '%s' in .julyconfig%s\n",
+           use_colors ? COLOR_GREEN : "", def_name, use_colors ? COLOR_RESET : "");
+    printf("%s    • Target: %s%s\n",
+           use_colors ? COLOR_CYAN : "", def_target, use_colors ? COLOR_RESET : "");
+    printf("%s    • Run '%s' or '%s build' to dispatch incremental builds.%s\n\n",
+           use_colors ? COLOR_BLUE : "", "july", "july", use_colors ? COLOR_RESET : "");
+    return 0;
+}
+
+static uint64_t hash_file_fnv1a(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint64_t h = 14695981039346656037ULL;
+    uint8_t buf[16384];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0)
+    {
+        for (ssize_t i = 0; i < n; i++)
+        {
+            h ^= (uint64_t)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    close(fd);
+    return h;
+}
+
+static bool is_path_ignored(const char *rel_path, const char *name, const JulyProjectConfig *cfg)
+{
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return true;
+    for (int i = 0; i < cfg->num_artifacts; i++)
+    {
+        if (strcmp(cfg->artifacts[i], name) == 0 || strcmp(cfg->artifacts[i], rel_path) == 0)
+            return true;
+    }
+    for (int i = 0; i < cfg->num_ignores; i++)
+    {
+        if (fnmatch(cfg->ignores[i], name, 0) == 0 ||
+            fnmatch(cfg->ignores[i], rel_path, 0) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void scan_project_dir_rec(const char *base_dir, const char *rel_prefix,
+                                 const JulyProjectConfig *cfg,
+                                 char files[MAX_PROJECT_FILES][MAX_PATH_LEN], int *count)
+{
+    char full_dir[1024];
+    if (rel_prefix[0])
+        snprintf(full_dir, sizeof(full_dir), "%s/%s", base_dir, rel_prefix);
+    else
+        safe_copy_str(full_dir, sizeof(full_dir), base_dir);
+
+    DIR *d = opendir(full_dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL)
+    {
+        char rel_path[MAX_PATH_LEN];
+        if (rel_prefix[0])
+            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, ent->d_name);
+        else
+            safe_copy_str(rel_path, sizeof(rel_path), ent->d_name);
+
+        if (is_path_ignored(rel_path, ent->d_name, cfg))
+            continue;
+
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, rel_path);
+
+        struct stat st;
+        if (lstat(full_path, &st) < 0) continue;
+
+        if (S_ISDIR(st.st_mode))
+        {
+            scan_project_dir_rec(base_dir, rel_path, cfg, files, count);
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            if (*count < MAX_PROJECT_FILES)
+            {
+                safe_copy_str(files[*count], sizeof(files[*count]), rel_path);
+                (*count)++;
+            }
+        }
+    }
+    closedir(d);
+}
+
+static int dispatch_project(const char *config_path, const char *override_host, int override_port, bool force_clean, int timeout_sec)
+{
+    FILE *f = fopen(config_path, "rb");
+    if (!f)
+    {
+        fprintf(stderr, "%s[!] Cannot open .julyconfig at '%s': %s%s\n",
+                use_colors ? COLOR_RED : "", config_path, strerror(errno), use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long clen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *cfg_json = malloc(clen + 1);
+    if (!cfg_json) { fclose(f); return 1; }
+    if (fread(cfg_json, 1, clen, f) != (size_t)clen) { fclose(f); free(cfg_json); return 1; }
+    cfg_json[clen] = '\0';
+    fclose(f);
+
+    JulyProjectConfig cfg;
+    if (parse_julyconfig(cfg_json, clen, &cfg) != 0)
+    {
+        fprintf(stderr, "%s[!] Failed to parse .julyconfig%s\n",
+                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        free(cfg_json);
+        return 1;
+    }
+    free(cfg_json);
+
+    // Determine target host and port
+    char host[256];
+    int port = DEFAULT_PORT;
+    char target_str[300];
+    if (override_host && override_host[0] != '\0')
+    {
+        safe_copy_str(host, sizeof(host), override_host);
+        port = override_port > 0 ? override_port : DEFAULT_PORT;
+        snprintf(target_str, sizeof(target_str), "%s:%d", host, port);
+    }
+    else
+    {
+        safe_copy_str(target_str, sizeof(target_str), cfg.target);
+        if (!parse_target_spec(target_str, host, sizeof(host), &port))
+        {
+            safe_copy_str(host, sizeof(host), DEFAULT_HOST);
+            port = DEFAULT_PORT;
+        }
+    }
+
+    // Project root directory
+    char root_dir[1024];
+    safe_copy_str(root_dir, sizeof(root_dir), config_path);
+    char *slash = strrchr(root_dir, '/');
+    if (slash) *slash = '\0';
+    else safe_copy_str(root_dir, sizeof(root_dir), ".");
+
+    // Scan project files
+    static char all_files[MAX_PROJECT_FILES][MAX_PATH_LEN];
+    int total_files = 0;
+    scan_project_dir_rec(root_dir, "", &cfg, all_files, &total_files);
+
+    // Read cache from .july/cache.bin
+    char cache_path[1024];
+    snprintf(cache_path, sizeof(cache_path), "%s/.july/cache.bin", root_dir);
+
+    static ProjectCacheEntry cached_entries[MAX_PROJECT_FILES];
+    int cached_count = 0;
+    FILE *cf = fopen(cache_path, "rb");
+    if (cf)
+    {
+        uint32_t cmagic = 0, cver = 0, ccnt = 0;
+        if (fread(&cmagic, sizeof(cmagic), 1, cf) == 1 && cmagic == JULY_CACHE_MAGIC &&
+            fread(&cver, sizeof(cver), 1, cf) == 1 && cver == 1 &&
+            fread(&ccnt, sizeof(ccnt), 1, cf) == 1)
+        {
+            if (ccnt > MAX_PROJECT_FILES) ccnt = MAX_PROJECT_FILES;
+            cached_count = (int)fread(cached_entries, sizeof(ProjectCacheEntry), ccnt, cf);
+        }
+        fclose(cf);
+    }
+
+    // Determine dirty files and build new cache entries
+    static ProjectCacheEntry new_entries[MAX_PROJECT_FILES];
+    static const char *dirty_files[MAX_PROJECT_FILES];
+    int dirty_count = 0;
+
+    for (int i = 0; i < total_files; i++)
+    {
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", root_dir, all_files[i]);
+        struct stat st;
+        if (stat(full_path, &st) < 0) continue;
+
+        safe_copy_str(new_entries[i].rel_path, sizeof(new_entries[i].rel_path), all_files[i]);
+        new_entries[i].mtime = (uint64_t)st.st_mtime;
+        new_entries[i].size = (uint64_t)st.st_size;
+
+        bool dirty = false;
+        if (force_clean || cached_count == 0)
+        {
+            dirty = true;
+            new_entries[i].hash = hash_file_fnv1a(full_path);
+        }
+        else
+        {
+            int found_idx = -1;
+            for (int k = 0; k < cached_count; k++)
+            {
+                if (strcmp(cached_entries[k].rel_path, all_files[i]) == 0)
+                {
+                    found_idx = k;
+                    break;
+                }
+            }
+
+            if (found_idx >= 0 &&
+                cached_entries[found_idx].mtime == (uint64_t)st.st_mtime &&
+                cached_entries[found_idx].size == (uint64_t)st.st_size)
+            {
+                new_entries[i].hash = cached_entries[found_idx].hash;
+                dirty = false;
+            }
+            else
+            {
+                new_entries[i].hash = hash_file_fnv1a(full_path);
+                if (found_idx < 0 || new_entries[i].hash != cached_entries[found_idx].hash)
+                {
+                    dirty = true;
+                }
+            }
+        }
+
+        if (dirty)
+        {
+            dirty_files[dirty_count++] = all_files[i];
+        }
+    }
+
+    printf("%s┌─────────────────────────────────────────────────────────────┐%s\n",
+           use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
+    printf("%s│             July Persistent Project Engine                  │%s\n",
+           use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
+    printf("%s│  Project: %-49s │%s\n",
+           use_colors ? COLOR_CYAN : "", cfg.project, use_colors ? COLOR_RESET : "");
+    printf("%s│  Target:  %-49s │%s\n",
+           use_colors ? COLOR_CYAN : "", target_str, use_colors ? COLOR_RESET : "");
+    printf("%s│  Mode:    %-49s │%s\n",
+           use_colors ? COLOR_CYAN : "",
+           force_clean ? "Clean Rebuild (All Files Dirty)" :
+           (dirty_count == 0 ? "All 100% Cached (Incremental Make)" : "Delta Update (Dirty Only)"),
+           use_colors ? COLOR_RESET : "");
+    printf("%s└─────────────────────────────────────────────────────────────┘%s\n",
+           use_colors ? COLOR_CYAN : "", use_colors ? COLOR_RESET : "");
+
+    printf("%s[+] Scanned %d project file(s): %d dirty, %d cached%s\n",
+           use_colors ? COLOR_BLUE : "", total_files, dirty_count, total_files - dirty_count, use_colors ? COLOR_RESET : "");
+    if (dirty_count > 0 && dirty_count <= 8)
+    {
+        for (int i = 0; i < dirty_count; i++)
+        {
+            printf("%s    ➔ Modified: %s%s\n",
+                   use_colors ? COLOR_YELLOW : "", dirty_files[i], use_colors ? COLOR_RESET : "");
+        }
+    }
+    else if (dirty_count > 8)
+    {
+        printf("%s    ➔ %d files modified (batch transmission)%s\n",
+               use_colors ? COLOR_YELLOW : "", dirty_count, use_colors ? COLOR_RESET : "");
+    }
+
+    // Synthesize JSON manifest in memory
+    char manifest_json[8192];
+    int mlen = snprintf(manifest_json, sizeof(manifest_json),
+        "{\n"
+        "  \"name\": \"%s\",\n"
+        "  \"build\": [",
+        cfg.project);
+
+    for (int i = 0; i < cfg.num_build_cmds; i++)
+    {
+        mlen += snprintf(manifest_json + mlen, sizeof(manifest_json) - mlen,
+            "\"%s\"%s", cfg.build_cmds[i], (i + 1 < cfg.num_build_cmds) ? ", " : "");
+    }
+    mlen += snprintf(manifest_json + mlen, sizeof(manifest_json) - mlen, "],\n  \"artifacts\": {\n    \"required\": [");
+    for (int i = 0; i < cfg.num_artifacts; i++)
+    {
+        mlen += snprintf(manifest_json + mlen, sizeof(manifest_json) - mlen,
+            "\"%s\"%s", cfg.artifacts[i], (i + 1 < cfg.num_artifacts) ? ", " : "");
+    }
+    mlen += snprintf(manifest_json + mlen, sizeof(manifest_json) - mlen, "]\n  }\n}\n");
+
+    WorkflowManifest manifest;
+    if (parse_workflow_manifest(manifest_json, (size_t)mlen, &manifest) != 0)
+    {
+        fprintf(stderr, "%s[!] Internal error constructing workflow manifest%s\n",
+                use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
+        return 1;
+    }
+
+    if (timeout_sec <= 0) timeout_sec = DEFAULT_TIMEOUT_SEC;
+
+    uint16_t env_flags = JULY_FLAG_WORKSPACE;
+    if (force_clean) env_flags |= JULY_FLAG_CLEAN;
+    else if (dirty_count < total_files && cached_count > 0) env_flags |= JULY_FLAG_DELTA;
+
+    char saved_cwd[1024];
+    if (getcwd(saved_cwd, sizeof(saved_cwd)))
+    {
+        chdir(root_dir);
+    }
+
+    struct timespec b_start, b_end;
+    clock_gettime(CLOCK_MONOTONIC, &b_start);
+
+    int ret = dispatch_envelope(host, port, manifest_json, (size_t)mlen, &manifest,
+                                dirty_count, dirty_files, env_flags, timeout_sec);
+
+    clock_gettime(CLOCK_MONOTONIC, &b_end);
+    double elapsed = (double)(b_end.tv_sec - b_start.tv_sec) +
+                     (double)(b_end.tv_nsec - b_start.tv_nsec) / 1e9;
+
+    chdir(saved_cwd);
+
+    if (ret == 0)
+    {
+        mkdir_p_parent(cache_path);
+        FILE *wcf = fopen(cache_path, "wb");
+        if (wcf)
+        {
+            uint32_t cmagic = JULY_CACHE_MAGIC;
+            uint32_t cver = 1;
+            uint32_t ccnt = (uint32_t)total_files;
+            fwrite(&cmagic, sizeof(cmagic), 1, wcf);
+            fwrite(&cver, sizeof(cver), 1, wcf);
+            fwrite(&ccnt, sizeof(ccnt), 1, wcf);
+            fwrite(new_entries, sizeof(ProjectCacheEntry), total_files, wcf);
+            fclose(wcf);
+        }
+
+        printf("%s[⚡] Project build finished in %.3f seconds!%s\n\n",
+               use_colors ? COLOR_GREEN : "", elapsed, use_colors ? COLOR_RESET : "");
+    }
+    return ret;
+}
+
 static void print_help(const char *prog)
 {
     printf("\n%sJuly Task & Workflow Dispatcher%s\n\n",
            use_colors ? COLOR_BOLD : "", use_colors ? COLOR_RESET : "");
     printf("Usage:\n");
-    printf("  # Workflow Container Execution:\n");
+    printf("  # Project / CAS Workspace Mode (with .julyconfig):\n");
+    printf("  %s init [project_name] [target]    Initialize a new July project (.julyconfig)\n", prog);
+    printf("  %s [build|run]                     Incremental build and sync changed files\n", prog);
+    printf("  %s clean                           Clean rebuild of persistent workspace\n\n", prog);
+    printf("  # Ad-Hoc Workflow Container Execution (No .julyconfig):\n");
     printf("  %s [host:port] workflow <manifest.json> [files...]\n", prog);
     printf("  %s workflow <manifest.json> [files...]\n\n", prog);
     printf("  # Shell Command Execution:\n");
     printf("  %s [host:port] \"<command>\"\n", prog);
     printf("  %s [host:port]                     (Interactive developer console)\n", prog);
-    printf("  %s                                 (Interactive console targeting default localhost:8080)\n\n", prog);
+    printf("  %s                                 (Interactive console or project build)\n\n", prog);
     printf("Options:\n");
     printf("  -h, --host <host>       Server IP or hostname (default: %s)\n", DEFAULT_HOST);
     printf("  -p, --port <port>       Server port (default: %d)\n", DEFAULT_PORT);
     printf("  -k, --token <token>     Authentication token (or set JULY_TOKEN)\n");
     printf("  -t, --timeout <sec>     Execution timeout in seconds (default: %d)\n", DEFAULT_TIMEOUT_SEC);
     printf("  -g, --get <taskId>      Retrieve output or artifact status of a task\n");
+    printf("  --clean                 Force clean rebuild of project workspace\n");
     printf("  --no-color              Disable ANSI color output\n");
     printf("  --help                  Show this help message\n\n");
     printf("Workflow Example:\n");
@@ -1016,12 +1566,20 @@ int main(int argc, char **argv)
 {
     use_colors = isatty(fileno(stdout));
 
+    if (argc >= 2 && strcmp(argv[1], "init") == 0)
+    {
+        const char *pname = argc >= 3 ? argv[2] : NULL;
+        const char *ptarget = argc >= 4 ? argv[3] : NULL;
+        return init_july_project(pname, ptarget);
+    }
+
     char host[256];
     safe_copy_str(host, sizeof(host), DEFAULT_HOST);
     int port = DEFAULT_PORT;
     int timeout_sec = DEFAULT_TIMEOUT_SEC;
     const char *retrieve_id = NULL;
     char command_buf[MAX_TASK_CMD] = {0};
+    bool clean_mode = false;
 
     // Environment overrides
     const char *env_host = getenv("DISPATCHER_HOST");
@@ -1046,6 +1604,10 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--no-color") == 0)
         {
             use_colors = false;
+        }
+        else if (strcmp(argv[i], "--clean") == 0 || strcmp(argv[i], "clean") == 0)
+        {
+            clean_mode = true;
         }
         else if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--token") == 0) && i + 1 < argc)
         {
@@ -1176,6 +1738,20 @@ int main(int argc, char **argv)
         }
     }
 
+    // Check if project workspace mode applies (.julyconfig exists)
+    char config_path[1024];
+    bool has_project = find_julyconfig(config_path, sizeof(config_path));
+    if (has_project && !workflow_mode && !retrieve_id)
+    {
+        if (command_buf[0] == '\0' || strcmp(command_buf, "build") == 0 ||
+            strcmp(command_buf, "run") == 0 || strcmp(command_buf, "clean") == 0)
+        {
+            return dispatch_project(config_path, host_set_by_pos ? host : NULL,
+                                    host_set_by_pos ? port : 0,
+                                    clean_mode || strcmp(command_buf, "clean") == 0, timeout_sec);
+        }
+    }
+
     // 3. One-Shot Command Execution
     if (command_buf[0] != '\0')
     {
@@ -1257,6 +1833,22 @@ int main(int argc, char **argv)
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0)
             break;
 
+        if (strcmp(line, "build") == 0 || strcmp(line, "run") == 0 || strcmp(line, "clean") == 0)
+        {
+            char cfg_p[1024];
+            if (find_julyconfig(cfg_p, sizeof(cfg_p)))
+            {
+                dispatch_project(cfg_p, host, port, strcmp(line, "clean") == 0, timeout_sec);
+                continue;
+            }
+            else
+            {
+                printf("%s[!] No .julyconfig found in current directory. Run 'july init' first.%s\n",
+                       use_colors ? COLOR_YELLOW : "", use_colors ? COLOR_RESET : "");
+                continue;
+            }
+        }
+
         if (strncmp(line, "run ", 4) == 0 || strncmp(line, "workflow ", 9) == 0)
         {
             char *args[64];
@@ -1286,7 +1878,9 @@ int main(int argc, char **argv)
         {
             printf("\n%sJuly Interactive Console Commands:%s\n",
                    use_colors ? COLOR_BOLD : "", use_colors ? COLOR_RESET : "");
-            printf("  run <manifest.json> [files...]   Bundle and dispatch remote workflow container\n");
+            printf("  build / run                      Incremental build and sync project (.julyconfig)\n");
+            printf("  clean                            Clean rebuild of persistent project workspace\n");
+            printf("  run <manifest.json> [files...]   Bundle and dispatch ad-hoc workflow container\n");
             printf("  workflow <manifest.json> [...]   Alias for 'run'\n");
             printf("  status / ping                    Check remote worker health & round-trip latency\n");
             printf("  <command>                        Execute raw remote shell command\n");

@@ -1,0 +1,18 @@
+{
+  "project": "sync_project",
+  "target": "192.168.1.41:8080",
+  "build": [
+    "make -j4",
+    "./sync_app"
+  ],
+  "artifacts": [
+    "sync_app"
+  ],
+  "ignore": [
+    ".git*",
+    "*.o",
+    ".july*",
+    "*.dSYM",
+    ".DS_Store"
+  ]
+}
