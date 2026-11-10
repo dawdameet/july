@@ -939,18 +939,24 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
         free(log_output);
     }
 
+    // Close poll socket after log retrieval is complete
+    if (poll_sock >= 0)
+    {
+        close(poll_sock);
+        poll_sock = -1;
+    }
+
     if (exit_code != 0)
     {
         printf("\n%s[✗] Workflow FAILED with exit code %d%s\n",
                use_colors ? COLOR_RED : "", exit_code, use_colors ? COLOR_RESET : "");
-        if (poll_sock >= 0) close(poll_sock);
         return exit_code;
     }
 
     printf("\n%s[✓] Workflow Completed Successfully (Exit Code: 0)!%s\n",
            use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "");
 
-    // Stage 5: Zero-copy artifact retrieval over the warm connection
+    // Stage 5: Zero-copy artifact retrieval
     if (manifest.num_required_artifacts > 0)
     {
         printf("%s[*] Downloading %d required artifact(s) via zero-copy sendfile()...%s\n",
@@ -963,7 +969,7 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
                    use_colors ? COLOR_BLUE : "", art, use_colors ? COLOR_RESET : "");
             fflush(stdout);
 
-            if (download_artifact_conn(&poll_sock, host, port, task_id, art) == 0)
+            if (download_artifact(host, port, task_id, art) == 0)
             {
                 struct stat ast;
                 stat(art, &ast);
@@ -976,12 +982,6 @@ static int dispatch_workflow(const char *host, int port, const char *manifest_fi
                        use_colors ? COLOR_RED : "", use_colors ? COLOR_RESET : "");
             }
         }
-    }
-
-    if (poll_sock >= 0)
-    {
-        close(poll_sock);
-        poll_sock = -1;
     }
 
     return 0;
