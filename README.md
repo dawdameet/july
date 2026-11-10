@@ -211,6 +211,40 @@ When working on multi-module codebases, you want incremental `make`—where chan
    ./dispatcher --clean
    ```
 
+### 6. Zero-SSH Self-Hosting & Blue-Green Remote Daemon Upgrades
+
+Because July is completely self-contained and provides ambient remote execution, **you can recompile and upgrade the July daemon remotely using July itself—zero SSH keys or external agents required.**
+
+```
+Workstation (Mac)                       Fedora Worker Node
+┌──────────────────────────────┐        ┌──────────────────────────────────────────────┐
+│                              │──Git──►│ 1. Pull & compile: make server               │
+│                              │        │                                              │
+│                              │──Cmd──►│ 2. Spawn Sibling on Port 8081: ./server 8081 │
+│                              │        │                                              │
+│                              │◄─RTT───│ 3. Probe sibling: "PORT 8081 IS ALIVE"       │
+│                              │        │                                              │
+│                              │──Kill─►│ 4. Decommission legacy 8080 daemon           │
+└──────────────────────────────┘        └──────────────────────────────────────────────┘
+```
+
+#### The Blue-Green Hot-Swap Sequence:
+1. **Pull & Recompile over Wire**:
+   ```bash
+   ./dispatcher 192.168.1.41:8080 "cd ~/july && git checkout -- server && git pull origin main && make server"
+   ```
+2. **Spawn Blue-Green Sibling Daemon**:
+   ```bash
+   ./dispatcher 192.168.1.41:8080 "cd ~/july && nohup ./server 8081 </dev/null >/tmp/server_8081.log 2>&1 &"
+   ```
+3. **Verify Sibling Health**:
+   ```bash
+   ./dispatcher 192.168.1.41:8081 "echo 'PORT 8081 IS ALIVE'"
+   # Output: [✓] Completed (exit=0): PORT 8081 IS ALIVE
+   ```
+4. **Decommission Legacy Process**:
+   Command the healthy sibling daemon on 8081 to terminate the legacy 8080 server and re-bind. Zero SSH keys, zero Ansible, zero external orchestration.
+
 ---
 
 ## Getting Started

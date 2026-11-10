@@ -31,6 +31,8 @@ All notable milestones, git commits, optimization breakthroughs, and architectur
       | **Ad-Hoc One-Shot (`echo hi`)** | 0 files | Raw TCP socket execution | **257 ms** |
     - **Microsecond Hashing**: 11-file local SHA-256 / FNV-1a scan completes in **0.48 ms**, with delta resolution taking **0.004 ms** ($< 1\text{ ms}$ total client overhead).
     - **Speedup**: 1.4x – 1.8x on small 5-module repos; eliminates 95%+ of compiler runtime on medium/large codebases by retaining `.o` build artifacts.
+  - **Zero-SSH Self-Hosting & Blue-Green Remote Upgrades**:
+    - Demonstrated remote daemon self-orchestration where July pulls its own git updates, compiles the server daemon natively on the remote host, spawns a sibling daemon on an alternate port (8081), verifies sibling health, and retires legacy processes without SSH keys.
 
 ---
 
