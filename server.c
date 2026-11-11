@@ -1253,6 +1253,7 @@ static int set_nonblocking(int fd)
     int flags = fcntl(fd, F_GETFL, 0);
     if (unlikely(flags < 0))
         return -1;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
@@ -1770,6 +1771,7 @@ static int run_exec_capture(const char *const argv[], char *out, size_t max_out)
             dup2(devnull, STDIN_FILENO);
             close(devnull);
         }
+        for (int fd = 3; fd < 256; fd++) close(fd);
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
@@ -3712,6 +3714,7 @@ int main(int argc, char **argv)
         close(server_fd);
         return EXIT_FAILURE;
     }
+    (void)fcntl(kq, F_SETFD, FD_CLOEXEC);
 
     struct kevent listen_event;
     EV_SET(&listen_event, server_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
