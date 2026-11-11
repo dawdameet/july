@@ -1,0 +1,24 @@
+{
+  "project": "july",
+  "target": "192.168.1.41:8080",
+  "build": [
+    "make clean",
+    "make"
+  ],
+  "artifacts": [
+    "server",
+    "dispatcher"
+  ],
+  "ignore": [
+    ".git*",
+    "*.o",
+    ".july*",
+    "*.dSYM",
+    ".DS_Store",
+    "server",
+    "dispatcher",
+    "dispatch",
+    "picture",
+    "app"
+  ]
+}
