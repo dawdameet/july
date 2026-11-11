@@ -1608,6 +1608,86 @@ static void probe_ollama_status(bool *up_out, bool *loaded_out)
     close(s);
 }
 
+static pthread_mutex_t g_cpu_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long g_prev_cpu_total = 0;
+static unsigned long long g_prev_cpu_idle = 0;
+
+static double sample_cpu_pct(void)
+{
+    unsigned long long total = 0, idle = 0;
+#if defined(__linux__)
+    FILE *f = fopen("/proc/stat", "r");
+    if (f)
+    {
+        unsigned long long user = 0, nice = 0, sys = 0, id = 0, iow = 0, irq = 0, sirq = 0, steal = 0;
+        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &user, &nice, &sys, &id, &iow, &irq, &sirq, &steal) >= 4)
+        {
+            idle = id + iow;
+            total = user + nice + sys + id + iow + irq + sirq + steal;
+        }
+        fclose(f);
+    }
+#elif defined(__APPLE__)
+    host_cpu_load_info_data_t cpuinfo;
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&cpuinfo, &count) == KERN_SUCCESS)
+    {
+        unsigned long long u = cpuinfo.cpu_ticks[CPU_STATE_USER];
+        unsigned long long s = cpuinfo.cpu_ticks[CPU_STATE_SYSTEM];
+        unsigned long long n = cpuinfo.cpu_ticks[CPU_STATE_NICE];
+        unsigned long long id = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
+        idle = id;
+        total = u + s + n + id;
+    }
+#endif
+    double pct = 0.0;
+    pthread_mutex_lock(&g_cpu_lock);
+    if (g_prev_cpu_total > 0 && total > g_prev_cpu_total)
+    {
+        unsigned long long dt = total - g_prev_cpu_total;
+        unsigned long long di = (idle >= g_prev_cpu_idle) ? (idle - g_prev_cpu_idle) : 0;
+        if (di > dt) di = dt;
+        pct = ((double)(dt - di) * 100.0) / (double)dt;
+    }
+    if (total > 0)
+    {
+        g_prev_cpu_total = total;
+        g_prev_cpu_idle = idle;
+    }
+    pthread_mutex_unlock(&g_cpu_lock);
+    return pct;
+}
+
+static double sample_cpu_temp_c(void)
+{
+#if defined(__linux__)
+    for (int i = 0; i < 6; i++)
+    {
+        char tpath[96], zpath[96];
+        snprintf(tpath, sizeof(tpath), "/sys/class/thermal/thermal_zone%d/temp", i);
+        snprintf(zpath, sizeof(zpath), "/sys/class/thermal/thermal_zone%d/type", i);
+        long raw = 0;
+        FILE *tf = fopen(tpath, "r");
+        if (!tf) continue;
+        int ok = fscanf(tf, "%ld", &raw);
+        fclose(tf);
+        if (ok != 1 || raw <= 0 || raw > 150000) continue;
+
+        char ztype[64] = {0};
+        FILE *zf = fopen(zpath, "r");
+        if (zf)
+        {
+            if (fgets(ztype, sizeof(ztype), zf) == NULL) ztype[0] = '\0';
+            fclose(zf);
+        }
+        if (strstr(ztype, "pkg") || strstr(ztype, "core") || strstr(ztype, "cpu") || strstr(ztype, "Tctl") || i == 0)
+            return (double)raw / 1000.0;
+    }
+#endif
+    return -1.0;
+}
+
 static void build_stats_json(char *out, size_t max_len)
 {
     char hostname[128] = "july-node";
@@ -1638,13 +1718,14 @@ static void build_stats_json(char *out, size_t max_len)
 #endif
 
     unsigned long long ram_total_mb = 0, ram_avail_mb = 0, ram_used_mb = 0;
+    unsigned long long swap_total_mb = 0, swap_used_mb = 0;
 #if defined(__linux__)
     FILE *mf = fopen("/proc/meminfo", "r");
     if (mf)
     {
         char k[64];
         unsigned long long v = 0;
-        unsigned long long mt = 0, ma = 0;
+        unsigned long long mt = 0, ma = 0, stot = 0, sfree = 0;
         char line[128];
         while (fgets(line, sizeof(line), mf))
         {
@@ -1652,12 +1733,16 @@ static void build_stats_json(char *out, size_t max_len)
             {
                 if (strcmp(k, "MemTotal") == 0) mt = v / 1024ULL;
                 else if (strcmp(k, "MemAvailable") == 0) ma = v / 1024ULL;
+                else if (strcmp(k, "SwapTotal") == 0) stot = v / 1024ULL;
+                else if (strcmp(k, "SwapFree") == 0) sfree = v / 1024ULL;
             }
         }
         fclose(mf);
         ram_total_mb = mt;
         ram_avail_mb = ma;
         ram_used_mb = (mt >= ma) ? (mt - ma) : 0;
+        swap_total_mb = stot;
+        swap_used_mb = (stot >= sfree) ? (stot - sfree) : 0;
     }
 #elif defined(__APPLE__)
     uint64_t mem_bytes = 0;
@@ -1679,6 +1764,13 @@ static void build_stats_json(char *out, size_t max_len)
             ram_used_mb = ram_total_mb - ram_avail_mb;
         }
     }
+    struct xsw_usage xsw;
+    size_t xlen = sizeof(xsw);
+    if (sysctlbyname("vm.swapusage", &xsw, &xlen, NULL, 0) == 0)
+    {
+        swap_total_mb = (unsigned long long)(xsw.xsu_total / (1024ULL * 1024ULL));
+        swap_used_mb = (unsigned long long)(xsw.xsu_used / (1024ULL * 1024ULL));
+    }
 #endif
 
     unsigned long long tmpfs_total_mb = 0, tmpfs_used_mb = 0;
@@ -1689,6 +1781,16 @@ static void build_stats_json(char *out, size_t max_len)
         unsigned long long avail = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
         tmpfs_total_mb = tot / (1024ULL * 1024ULL);
         tmpfs_used_mb = (tot >= avail) ? ((tot - avail) / (1024ULL * 1024ULL)) : 0;
+    }
+
+    unsigned long long disk_total_mb = 0, disk_used_mb = 0;
+    struct statvfs rvfs;
+    if (statvfs("/", &rvfs) == 0 && rvfs.f_blocks > 0)
+    {
+        unsigned long long dtot = (unsigned long long)rvfs.f_blocks * (unsigned long long)rvfs.f_frsize;
+        unsigned long long davail = (unsigned long long)rvfs.f_bavail * (unsigned long long)rvfs.f_frsize;
+        disk_total_mb = dtot / (1024ULL * 1024ULL);
+        disk_used_mb = (dtot >= davail) ? ((dtot - davail) / (1024ULL * 1024ULL)) : 0;
     }
 
     pthread_mutex_lock(&queue.lock);
@@ -1725,6 +1827,8 @@ static void build_stats_json(char *out, size_t max_len)
     bool ollama_up = false;
     bool ollama_loaded = false;
     probe_ollama_status(&ollama_up, &ollama_loaded);
+    double cpu_pct = sample_cpu_pct();
+    double cpu_temp_c = sample_cpu_temp_c();
     char ts_ip[64] = {0};
     find_tailscale_ip(ts_ip, sizeof(ts_ip));
     long uptime_sec = (long)(time(NULL) - g_server_start_time);
@@ -1732,16 +1836,20 @@ static void build_stats_json(char *out, size_t max_len)
     size_t pos = 0;
     pos += (size_t)snprintf(out + pos, max_len - pos,
         "{\"hostname\":\"%s\",\"os\":\"%s\",\"arch\":\"%s\",\"cores\":%ld,"
-        "\"load_1m\":%.2f,\"load_5m\":%.2f,"
+        "\"load_1m\":%.2f,\"load_5m\":%.2f,\"cpu_pct\":%.1f,\"cpu_temp_c\":%.1f,"
         "\"ram_total_mb\":%llu,\"ram_used_mb\":%llu,\"ram_available_mb\":%llu,"
+        "\"swap_total_mb\":%llu,\"swap_used_mb\":%llu,"
         "\"tmpfs_total_mb\":%llu,\"tmpfs_used_mb\":%llu,"
+        "\"disk_total_mb\":%llu,\"disk_used_mb\":%llu,"
         "\"queue_depth\":%d,\"max_queue\":%d,\"active_tasks\":%d,"
         "\"uptime_sec\":%ld,\"ollama_up\":%s,\"ollama_loaded\":%s,"
         "\"tailscale_ip\":\"%s\",\"auth_required\":%s,\"workspaces\":[",
         hostname, os_name, arch_name, cores,
-        load1, load5,
+        load1, load5, cpu_pct, cpu_temp_c,
         ram_total_mb, ram_used_mb, ram_avail_mb,
+        swap_total_mb, swap_used_mb,
         tmpfs_total_mb, tmpfs_used_mb,
+        disk_total_mb, disk_used_mb,
         q_depth, MAX_QUEUE, active_cnt,
         uptime_sec, ollama_up ? "true" : "false", ollama_loaded ? "true" : "false",
         ts_ip, (g_auth_token[0] != '\0') ? "true" : "false");
