@@ -82,7 +82,7 @@ const styles = StyleSheet.create({
     maxWidth: MaxContentWidth,
     paddingVertical: Spacing.two,
     paddingHorizontal: Spacing.three,
-    borderRadius: 0,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: Palette.border,
     backgroundColor: Palette.cardHeader,
@@ -107,7 +107,7 @@ const styles = StyleSheet.create({
   tabButtonView: {
     paddingVertical: 6,
     paddingHorizontal: 12,
-    borderRadius: 0,
+    borderRadius: 8,
   },
   tabLabel: {
     fontFamily: Fonts.semibold,

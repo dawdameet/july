@@ -204,7 +204,7 @@ const styles = StyleSheet.create({
   chip: {
     paddingHorizontal: 11,
     paddingVertical: 6,
-    borderRadius: 0,
+    borderRadius: 8,
     backgroundColor: Palette.card,
     borderWidth: 1,
     borderColor: Palette.border,
@@ -214,7 +214,7 @@ const styles = StyleSheet.create({
   chipTextActive: { color: Palette.inverseText, fontWeight: '700' },
   card: {
     backgroundColor: Palette.card,
-    borderRadius: 0,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: Palette.border,
     padding: 16,
@@ -224,7 +224,7 @@ const styles = StyleSheet.create({
   filePill: {
     paddingHorizontal: 10,
     paddingVertical: 5,
-    borderRadius: 0,
+    borderRadius: 7,
     backgroundColor: Palette.bg,
     borderWidth: 1,
     borderColor: Palette.border,
@@ -234,7 +234,7 @@ const styles = StyleSheet.create({
   filePillTextActive: { color: Palette.text, fontWeight: '700' },
   imgWrap: {
     backgroundColor: Palette.bg,
-    borderRadius: 0,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: Palette.border,
     overflow: 'hidden',
@@ -242,7 +242,7 @@ const styles = StyleSheet.create({
   osImage: { width: '100%', aspectRatio: 4 / 3 },
   codeBox: {
     backgroundColor: Palette.bg,
-    borderRadius: 0,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: Palette.border,
     padding: 12,
