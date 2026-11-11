@@ -24,9 +24,15 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <dirent.h>
+#include <sys/statvfs.h>
+#include <sys/utsname.h>
+#include <time.h>
 
 #if defined(__APPLE__)
 #include <sys/event.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
 #else
 #include <sched.h>
 #include <sys/epoll.h>
@@ -107,15 +113,46 @@ typedef enum {
     TASK_STATUS_COMPLETED
 } TaskStatus;
 
+#define MAX_RECENT_TASKS 64
+
 typedef struct TaskResult {
     char taskId[MAX_TASK_ID];
+    char label[64];
+    bool is_workflow;
+    bool killed;
     TaskStatus status;
     int exit_code;
     int artifacts_count;
+    pid_t active_pgid;
+    time_t created_at;
+    time_t finished_at;
     size_t output_len;
     char output[MAX_TASK_OUTPUT];
     int next; // index within this stripe's entries
 } TaskResult;
+
+static time_t g_server_start_time = 0;
+static pthread_mutex_t g_recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_recent_tasks[MAX_RECENT_TASKS][MAX_TASK_ID];
+static int g_recent_head = 0;
+static int g_recent_count = 0;
+
+static void record_recent_task_id(const char *task_id)
+{
+    pthread_mutex_lock(&g_recent_lock);
+    for (int i = 0; i < g_recent_count; i++)
+    {
+        if (strncmp(g_recent_tasks[i], task_id, MAX_TASK_ID) == 0)
+        {
+            pthread_mutex_unlock(&g_recent_lock);
+            return;
+        }
+    }
+    snprintf(g_recent_tasks[g_recent_head], MAX_TASK_ID, "%s", task_id);
+    g_recent_head = (g_recent_head + 1) % MAX_RECENT_TASKS;
+    if (g_recent_count < MAX_RECENT_TASKS) g_recent_count++;
+    pthread_mutex_unlock(&g_recent_lock);
+}
 
 typedef struct {
     pthread_mutex_t lock;
@@ -137,6 +174,7 @@ static inline unsigned int hash_task_id(const char *str)
 
 static void init_result_store(void)
 {
+    g_server_start_time = time(NULL);
     for (int s = 0; s < NUM_STRIPES; s++)
     {
         pthread_mutex_init(&g_stripes[s].lock, NULL);
@@ -152,6 +190,7 @@ static void init_result_store(void)
 
 static void task_result_record_enqueued(const char *task_id)
 {
+    record_recent_task_id(task_id);
     unsigned int h = hash_task_id(task_id);
     ResultStripe *st = &g_stripes[h % NUM_STRIPES];
     unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
@@ -165,6 +204,10 @@ static void task_result_record_enqueued(const char *task_id)
             st->entries[idx].status = TASK_STATUS_QUEUED;
             st->entries[idx].exit_code = 0;
             st->entries[idx].artifacts_count = 0;
+            st->entries[idx].active_pgid = 0;
+            st->entries[idx].killed = false;
+            st->entries[idx].created_at = time(NULL);
+            st->entries[idx].finished_at = 0;
             st->entries[idx].output_len = 0;
             st->entries[idx].output[0] = '\0';
             pthread_mutex_unlock(&st->lock);
@@ -197,15 +240,93 @@ static void task_result_record_enqueued(const char *task_id)
         id_len = MAX_TASK_ID - 1;
     memcpy(st->entries[idx].taskId, task_id, id_len);
     st->entries[idx].taskId[id_len] = '\0';
+    st->entries[idx].label[0] = '\0';
+    st->entries[idx].is_workflow = (strncmp(task_id, "wf_", 3) == 0);
+    st->entries[idx].killed = false;
     st->entries[idx].status = TASK_STATUS_QUEUED;
     st->entries[idx].exit_code = 0;
     st->entries[idx].artifacts_count = 0;
+    st->entries[idx].active_pgid = 0;
+    st->entries[idx].created_at = time(NULL);
+    st->entries[idx].finished_at = 0;
     st->entries[idx].output_len = 0;
     st->entries[idx].output[0] = '\0';
     st->entries[idx].next = st->buckets[b];
     st->buckets[b] = idx;
 
     pthread_mutex_unlock(&st->lock);
+}
+
+static void task_result_set_meta(const char *task_id, const char *label, bool is_workflow)
+{
+    unsigned int h = hash_task_id(task_id);
+    ResultStripe *st = &g_stripes[h % NUM_STRIPES];
+    unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
+
+    pthread_mutex_lock(&st->lock);
+    int idx = st->buckets[b];
+    while (idx != -1)
+    {
+        if (strncmp(st->entries[idx].taskId, task_id, MAX_TASK_ID) == 0)
+        {
+            if (label && label[0] != '\0' && st->entries[idx].label[0] == '\0')
+                snprintf(st->entries[idx].label, sizeof(st->entries[idx].label), "%s", label);
+            st->entries[idx].is_workflow = is_workflow;
+            break;
+        }
+        idx = st->entries[idx].next;
+    }
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void task_result_set_pgid(const char *task_id, pid_t pgid)
+{
+    if (!task_id || task_id[0] == '\0') return;
+    unsigned int h = hash_task_id(task_id);
+    ResultStripe *st = &g_stripes[h % NUM_STRIPES];
+    unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
+
+    pthread_mutex_lock(&st->lock);
+    int idx = st->buckets[b];
+    while (idx != -1)
+    {
+        if (strncmp(st->entries[idx].taskId, task_id, MAX_TASK_ID) == 0)
+        {
+            st->entries[idx].active_pgid = pgid;
+            break;
+        }
+        idx = st->entries[idx].next;
+    }
+    pthread_mutex_unlock(&st->lock);
+}
+
+static bool task_result_kill(const char *task_id)
+{
+    unsigned int h = hash_task_id(task_id);
+    ResultStripe *st = &g_stripes[h % NUM_STRIPES];
+    unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
+    pid_t pgid = 0;
+
+    pthread_mutex_lock(&st->lock);
+    int idx = st->buckets[b];
+    while (idx != -1)
+    {
+        if (strncmp(st->entries[idx].taskId, task_id, MAX_TASK_ID) == 0)
+        {
+            pgid = st->entries[idx].active_pgid;
+            if (pgid > 0) st->entries[idx].killed = true;
+            break;
+        }
+        idx = st->entries[idx].next;
+    }
+    pthread_mutex_unlock(&st->lock);
+
+    if (pgid > 0)
+    {
+        kill(-pgid, SIGKILL);
+        return true;
+    }
+    return false;
 }
 
 static void task_result_record_running(const char *task_id)
@@ -244,6 +365,8 @@ static void task_result_record_completed_full(const char *task_id, int exit_code
             st->entries[idx].status = TASK_STATUS_COMPLETED;
             st->entries[idx].exit_code = exit_code;
             st->entries[idx].artifacts_count = artifacts_count;
+            st->entries[idx].active_pgid = 0;
+            st->entries[idx].finished_at = time(NULL);
             if (out_len >= MAX_TASK_OUTPUT)
                 out_len = MAX_TASK_OUTPUT - 1;
             memcpy(st->entries[idx].output, output, out_len);
@@ -283,6 +406,12 @@ static void task_result_record_completed_full(const char *task_id, int exit_code
         st->entries[idx].status = TASK_STATUS_COMPLETED;
         st->entries[idx].exit_code = exit_code;
         st->entries[idx].artifacts_count = artifacts_count;
+        st->entries[idx].active_pgid = 0;
+        st->entries[idx].killed = false;
+        st->entries[idx].label[0] = '\0';
+        st->entries[idx].is_workflow = (strncmp(task_id, "wf_", 3) == 0);
+        st->entries[idx].created_at = time(NULL);
+        st->entries[idx].finished_at = st->entries[idx].created_at;
         if (out_len >= MAX_TASK_OUTPUT)
             out_len = MAX_TASK_OUTPUT - 1;
         memcpy(st->entries[idx].output, output, out_len);
@@ -337,7 +466,7 @@ static int task_result_get(const char *task_id, TaskStatus *status, int *exit_co
 
 static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
                                   int log_fd, int timeout_sec, bool kill_if_timeout,
-                                  const WorkflowManifest *manifest)
+                                  const WorkflowManifest *manifest, const char *task_id)
 {
     int pipefd[2];
     if (pipe(pipefd) < 0)
@@ -438,6 +567,8 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
 
     // Parent
     close(pipefd[1]);
+    setpgid(pid, pid);
+    task_result_set_pgid(task_id, pid);
 
     int fl = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, fl | O_NONBLOCK);
@@ -522,6 +653,7 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
         }
     }
     close(pipefd[0]);
+    task_result_set_pgid(task_id, 0);
 
     if (timed_out)
         return 124;
@@ -671,6 +803,7 @@ int execute_workflow_task(const Task *task)
     }
 
     dprintf(log_fd, "=== July Workflow: %s (Task ID: %s) ===\n", manifest.name, task->taskId);
+    task_result_set_meta(task->taskId, manifest.name[0] ? manifest.name : task->taskId, true);
     if (manifest.sandbox_memory_mb > 0 || manifest.sandbox_max_pids > 0 || manifest.sandbox_namespace || !manifest.sandbox_network)
     {
         dprintf(log_fd, "[Sandbox] Config: net=%s, mem=%dMB, pids=%s, ns=%s\n",
@@ -710,7 +843,7 @@ int execute_workflow_task(const Task *task)
         dprintf(log_fd, "[Deps] Cloning from GitHub: %s\n", manifest.github_link);
         char git_cmd[1024];
         snprintf(git_cmd, sizeof(git_cmd), "git clone --depth 1 %s .", manifest.github_link);
-        int rc = run_command_in_sandbox(git_cmd, sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
+        int rc = run_command_in_sandbox(git_cmd, sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest, task->taskId);
         if (rc != 0)
         {
             dprintf(log_fd, "[Deps] Git clone failed with exit code %d\n", rc);
@@ -722,7 +855,7 @@ int execute_workflow_task(const Task *task)
     for (int i = 0; i < manifest.num_deps; i++)
     {
         dprintf(log_fd, "[Deps] Executing: %s\n", manifest.deps[i]);
-        int rc = run_command_in_sandbox(manifest.deps[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
+        int rc = run_command_in_sandbox(manifest.deps[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest, task->taskId);
         if (rc != 0)
         {
             dprintf(log_fd, "[Deps] Dependency failed with exit code %d\n", rc);
@@ -735,7 +868,7 @@ int execute_workflow_task(const Task *task)
     for (int i = 0; i < manifest.num_build_cmds; i++)
     {
         dprintf(log_fd, "[Build] Executing: %s\n", manifest.build_cmds[i]);
-        int rc = run_command_in_sandbox(manifest.build_cmds[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest);
+        int rc = run_command_in_sandbox(manifest.build_cmds[i], sandbox_dir, log_fd, manifest.timeout_sec, manifest.kill_if_timeout, &manifest, task->taskId);
         if (rc != 0)
         {
             dprintf(log_fd, "[Build] Command failed with exit code %d\n", rc);
@@ -1302,10 +1435,589 @@ static bool extract_retrieve_id(const char *req, size_t req_len, char *task_id_o
     return false;
 }
 
+static void send_json_response(Connection *conn, int code, const char *status_text, const char *body)
+{
+    size_t blen = body ? strlen(body) : 0;
+    bool want_close = request_wants_close(conn->input, conn->header_bytes);
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-July-Token, Authorization\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        code, status_text, blen, want_close ? "close" : "keep-alive");
+    write_dynamic_response(conn, hdr, (size_t)hlen, body ? body : "", blen);
+}
+
+static size_t json_escape_append(char *dst, size_t pos, size_t max, const char *src)
+{
+    if (!src) return pos;
+    for (; *src && pos + 6 < max; src++)
+    {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') { dst[pos++] = '\\'; dst[pos++] = (char)c; }
+        else if (c == '\n') { dst[pos++] = '\\'; dst[pos++] = 'n'; }
+        else if (c == '\r') { dst[pos++] = '\\'; dst[pos++] = 'r'; }
+        else if (c == '\t') { dst[pos++] = '\\'; dst[pos++] = 't'; }
+        else if (c >= 0x20) { dst[pos++] = (char)c; }
+    }
+    dst[pos] = '\0';
+    return pos;
+}
+
+static void probe_ollama_status(bool *up_out, bool *loaded_out)
+{
+    *up_out = false;
+    *loaded_out = false;
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return;
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(11434);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    int rc = connect(s, (struct sockaddr *)&addr, sizeof(addr));
+    bool up = false;
+    if (rc == 0) up = true;
+    else if (errno == EINPROGRESS)
+    {
+        struct pollfd pfd = {.fd = s, .events = POLLOUT, .revents = 0};
+        if (poll(&pfd, 1, 20) > 0 && (pfd.revents & POLLOUT))
+        {
+            int so_err = 0;
+            socklen_t sl = sizeof(so_err);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &sl) == 0 && so_err == 0)
+                up = true;
+        }
+    }
+    if (!up)
+    {
+        close(s);
+        return;
+    }
+
+    *up_out = true;
+    const char req[] = "GET /api/ps HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    ssize_t sent = send(s, req, sizeof(req) - 1, 0);
+    if (sent > 0)
+    {
+        char buf[1024];
+        size_t tot = 0;
+        for (int tries = 0; tries < 2 && tot + 1 < sizeof(buf); tries++)
+        {
+            struct pollfd rfd = {.fd = s, .events = POLLIN, .revents = 0};
+            if (poll(&rfd, 1, 35) <= 0 || !(rfd.revents & POLLIN)) break;
+            ssize_t n = recv(s, buf + tot, sizeof(buf) - 1 - tot, 0);
+            if (n <= 0) break;
+            tot += (size_t)n;
+        }
+        buf[tot] = '\0';
+        if (strstr(buf, "\"models\":[{") != NULL || strstr(buf, "\"size\":") != NULL)
+        {
+            *loaded_out = true;
+        }
+    }
+    close(s);
+}
+
+static void build_stats_json(char *out, size_t max_len)
+{
+    char hostname[128] = "july-node";
+    gethostname(hostname, sizeof(hostname) - 1);
+    struct utsname uts;
+    const char *os_name = "linux";
+    const char *arch_name = "x86_64";
+    if (uname(&uts) == 0)
+    {
+        os_name = strcmp(uts.sysname, "Darwin") == 0 ? "darwin" : "linux";
+        arch_name = uts.machine;
+    }
+
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+
+    double load1 = 0.0, load5 = 0.0;
+#if defined(__linux__)
+    FILE *lf = fopen("/proc/loadavg", "r");
+    if (lf)
+    {
+        if (fscanf(lf, "%lf %lf", &load1, &load5) < 1) load1 = 0.0;
+        fclose(lf);
+    }
+#else
+    double la[2] = {0.0, 0.0};
+    if (getloadavg(la, 2) > 0) { load1 = la[0]; load5 = la[1]; }
+#endif
+
+    unsigned long long ram_total_mb = 0, ram_avail_mb = 0, ram_used_mb = 0;
+#if defined(__linux__)
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (mf)
+    {
+        char k[64];
+        unsigned long long v = 0;
+        unsigned long long mt = 0, ma = 0;
+        char line[128];
+        while (fgets(line, sizeof(line), mf))
+        {
+            if (sscanf(line, "%63[^:]: %llu", k, &v) == 2)
+            {
+                if (strcmp(k, "MemTotal") == 0) mt = v / 1024ULL;
+                else if (strcmp(k, "MemAvailable") == 0) ma = v / 1024ULL;
+            }
+        }
+        fclose(mf);
+        ram_total_mb = mt;
+        ram_avail_mb = ma;
+        ram_used_mb = (mt >= ma) ? (mt - ma) : 0;
+    }
+#elif defined(__APPLE__)
+    uint64_t mem_bytes = 0;
+    size_t mem_len = sizeof(mem_bytes);
+    if (sysctlbyname("hw.memsize", &mem_bytes, &mem_len, NULL, 0) == 0)
+    {
+        ram_total_mb = (unsigned long long)(mem_bytes / (1024ULL * 1024ULL));
+        vm_statistics64_data_t vmstat;
+        mach_msg_type_number_t vm_count = HOST_VM_INFO64_COUNT;
+        vm_size_t page_size = 4096;
+        host_page_size(mach_host_self(), &page_size);
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmstat, &vm_count) == KERN_SUCCESS)
+        {
+            unsigned long long free_bytes =
+                ((unsigned long long)vmstat.free_count + (unsigned long long)vmstat.inactive_count) *
+                (unsigned long long)page_size;
+            ram_avail_mb = free_bytes / (1024ULL * 1024ULL);
+            if (ram_avail_mb > ram_total_mb) ram_avail_mb = ram_total_mb;
+            ram_used_mb = ram_total_mb - ram_avail_mb;
+        }
+    }
+#endif
+
+    unsigned long long tmpfs_total_mb = 0, tmpfs_used_mb = 0;
+    struct statvfs vfs;
+    if (statvfs("/tmp", &vfs) == 0 && vfs.f_blocks > 0)
+    {
+        unsigned long long tot = (unsigned long long)vfs.f_blocks * (unsigned long long)vfs.f_frsize;
+        unsigned long long avail = (unsigned long long)vfs.f_bavail * (unsigned long long)vfs.f_frsize;
+        tmpfs_total_mb = tot / (1024ULL * 1024ULL);
+        tmpfs_used_mb = (tot >= avail) ? ((tot - avail) / (1024ULL * 1024ULL)) : 0;
+    }
+
+    pthread_mutex_lock(&queue.lock);
+    int q_depth = queue.count;
+    pthread_mutex_unlock(&queue.lock);
+
+    int active_cnt = 0;
+    pthread_mutex_lock(&g_recent_lock);
+    int rcnt = g_recent_count;
+    char ids[MAX_RECENT_TASKS][MAX_TASK_ID];
+    for (int i = 0; i < rcnt; i++)
+        memcpy(ids[i], g_recent_tasks[i], MAX_TASK_ID);
+    pthread_mutex_unlock(&g_recent_lock);
+
+    for (int i = 0; i < rcnt; i++)
+    {
+        unsigned int h = hash_task_id(ids[i]);
+        ResultStripe *st = &g_stripes[h % NUM_STRIPES];
+        unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
+        pthread_mutex_lock(&st->lock);
+        int idx = st->buckets[b];
+        while (idx != -1)
+        {
+            if (strncmp(st->entries[idx].taskId, ids[i], MAX_TASK_ID) == 0)
+            {
+                if (st->entries[idx].status == TASK_STATUS_RUNNING) active_cnt++;
+                break;
+            }
+            idx = st->entries[idx].next;
+        }
+        pthread_mutex_unlock(&st->lock);
+    }
+
+    bool ollama_up = false;
+    bool ollama_loaded = false;
+    probe_ollama_status(&ollama_up, &ollama_loaded);
+    long uptime_sec = (long)(time(NULL) - g_server_start_time);
+
+    size_t pos = 0;
+    pos += (size_t)snprintf(out + pos, max_len - pos,
+        "{\"hostname\":\"%s\",\"os\":\"%s\",\"arch\":\"%s\",\"cores\":%ld,"
+        "\"load_1m\":%.2f,\"load_5m\":%.2f,"
+        "\"ram_total_mb\":%llu,\"ram_used_mb\":%llu,\"ram_available_mb\":%llu,"
+        "\"tmpfs_total_mb\":%llu,\"tmpfs_used_mb\":%llu,"
+        "\"queue_depth\":%d,\"max_queue\":%d,\"active_tasks\":%d,"
+        "\"uptime_sec\":%ld,\"ollama_up\":%s,\"ollama_loaded\":%s,\"workspaces\":[",
+        hostname, os_name, arch_name, cores,
+        load1, load5,
+        ram_total_mb, ram_used_mb, ram_avail_mb,
+        tmpfs_total_mb, tmpfs_used_mb,
+        q_depth, MAX_QUEUE, active_cnt,
+        uptime_sec, ollama_up ? "true" : "false", ollama_loaded ? "true" : "false");
+
+    DIR *wd = opendir("/tmp/july_workspaces");
+    if (wd)
+    {
+        struct dirent *ent;
+        bool first = true;
+        while ((ent = readdir(wd)) != NULL && pos + 64 < max_len)
+        {
+            if (ent->d_name[0] == '.') continue;
+            if (!first) pos += (size_t)snprintf(out + pos, max_len - pos, ",");
+            out[pos++] = '"';
+            pos = json_escape_append(out, pos, max_len - 16, ent->d_name);
+            out[pos++] = '"';
+            first = false;
+        }
+        closedir(wd);
+    }
+    snprintf(out + pos, max_len - pos, "]}");
+}
+
+static const char *find_tmux_bin(void)
+{
+    if (access("/opt/homebrew/bin/tmux", X_OK) == 0) return "/opt/homebrew/bin/tmux";
+    if (access("/usr/local/bin/tmux", X_OK) == 0) return "/usr/local/bin/tmux";
+    if (access("/usr/bin/tmux", X_OK) == 0) return "/usr/bin/tmux";
+    return "tmux";
+}
+
+static int run_exec_capture(const char *const argv[], char *out, size_t max_out)
+{
+    bool capture = (out != NULL && max_out > 1);
+    if (out && max_out > 0) out[0] = '\0';
+
+    int pfd[2] = {-1, -1};
+    if (capture && pipe(pfd) != 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        if (capture)
+        {
+            close(pfd[0]);
+            close(pfd[1]);
+        }
+        return -1;
+    }
+    if (pid == 0)
+    {
+        int devnull = open("/dev/null", O_RDWR);
+        if (capture)
+        {
+            close(pfd[0]);
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[1]);
+            if (devnull >= 0) dup2(devnull, STDERR_FILENO);
+        }
+        else if (devnull >= 0)
+        {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (!capture)
+    {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+
+    close(pfd[1]);
+    int fl = fcntl(pfd[0], F_GETFL, 0);
+    if (fl >= 0) fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK);
+
+    size_t pos = 0;
+    bool exited = false;
+    while (pos + 1 < max_out)
+    {
+        struct pollfd rfd = {.fd = pfd[0], .events = POLLIN, .revents = 0};
+        int prc = poll(&rfd, 1, exited ? 15 : 1500);
+        if (prc > 0 && (rfd.revents & (POLLIN | POLLHUP)))
+        {
+            ssize_t n = read(pfd[0], out + pos, max_out - 1 - pos);
+            if (n > 0)
+            {
+                pos += (size_t)n;
+                continue;
+            }
+            if (n == 0) break;
+            if (errno != EAGAIN && errno != EINTR) break;
+        }
+        else if (prc == 0 && exited)
+        {
+            break;
+        }
+        else if (prc < 0 && errno != EINTR)
+        {
+            break;
+        }
+
+        if (!exited)
+        {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) exited = true;
+            else if (prc == 0) break;
+        }
+    }
+    out[pos] = '\0';
+    close(pfd[0]);
+
+    if (!exited)
+    {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void sanitize_tmux_name(const char *in, char *out, size_t out_max)
+{
+    size_t j = 0;
+    if (in)
+    {
+        for (size_t i = 0; in[i] && j + 1 < out_max; i++)
+        {
+            char c = in[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-')
+            {
+                out[j++] = c;
+            }
+        }
+    }
+    if (j == 0 && out_max > 5)
+    {
+        strcpy(out, "july");
+        return;
+    }
+    out[j] = '\0';
+}
+
+static void extract_query_param(const char *req_line, const char *key, char *out, size_t out_max)
+{
+    out[0] = '\0';
+    if (!req_line || !key) return;
+    const char *q = strchr(req_line, '?');
+    const char *sp = strpbrk(req_line + 4, " \r\n");
+    if (!q || (sp && q > sp)) return;
+    q++;
+    size_t klen = strlen(key);
+    while (q && (!sp || q < sp) && *q && *q != ' ' && *q != '\r' && *q != '\n')
+    {
+        const char *amp = strchr(q, '&');
+        const char *end = (amp && (!sp || amp < sp)) ? amp : sp;
+        if (!end) end = q + strlen(q);
+        if ((size_t)(end - q) > klen && strncmp(q, key, klen) == 0 && q[klen] == '=')
+        {
+            const char *val = q + klen + 1;
+            size_t vlen = (size_t)(end - val);
+            if (vlen >= out_max) vlen = out_max - 1;
+            memcpy(out, val, vlen);
+            out[vlen] = '\0';
+            return;
+        }
+        if (!amp || (sp && amp >= sp)) break;
+        q = amp + 1;
+    }
+}
+
+static bool tmux_ensure_session(const char *tmux_bin, const char *sess, const char *cwd)
+{
+    const char *has_argv[] = {tmux_bin, "has-session", "-t", sess, NULL};
+    if (run_exec_capture(has_argv, NULL, 0) == 0) return true;
+
+    const char *start_dir = NULL;
+    if (cwd && cwd[0] && access(cwd, F_OK) == 0) start_dir = cwd;
+    else
+    {
+        start_dir = getenv("HOME");
+        if (!start_dir || access(start_dir, F_OK) != 0) start_dir = "/tmp";
+    }
+    const char *new_argv[] = {tmux_bin, "new-session", "-d", "-s", sess, "-c", start_dir, NULL};
+    if (run_exec_capture(new_argv, NULL, 0) != 0) return false;
+
+    const char *hist_argv[] = {tmux_bin, "set-option", "-t", sess, "history-limit", "5000", NULL};
+    run_exec_capture(hist_argv, NULL, 0);
+    usleep(60000);
+    return true;
+}
+
+static void tmux_get_meta(const char *tmux_bin, const char *sess, char *cwd_out, size_t cwd_max, char *proc_out, size_t proc_max)
+{
+    cwd_out[0] = '\0';
+    proc_out[0] = '\0';
+    char meta[768] = {0};
+    const char *argv[] = {tmux_bin, "display-message", "-t", sess, "-p", "#{pane_current_path}\t#{pane_current_command}", NULL};
+    if (run_exec_capture(argv, meta, sizeof(meta)) == 0)
+    {
+        char *nl = strpbrk(meta, "\r\n");
+        if (nl) *nl = '\0';
+        char *tab = strchr(meta, '\t');
+        if (tab)
+        {
+            *tab = '\0';
+            safe_copy_str(cwd_out, cwd_max, meta);
+            safe_copy_str(proc_out, proc_max, tab + 1);
+        }
+        else
+        {
+            safe_copy_str(cwd_out, cwd_max, meta);
+        }
+    }
+}
+
+static bool is_allowed_tmux_key(const char *k)
+{
+    static const char *const allowed[] = {
+        "C-c", "C-d", "C-z", "C-l", "Enter", "Escape", "Tab", "Up", "Down", "BSpace"
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+    {
+        if (strcmp(k, allowed[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void build_tasks_json(char *out, size_t max_len)
+{
+    pthread_mutex_lock(&g_recent_lock);
+    int cnt = g_recent_count;
+    int head = g_recent_head;
+    char ids[MAX_RECENT_TASKS][MAX_TASK_ID];
+    for (int i = 0; i < cnt; i++)
+    {
+        int ring_idx = (head - 1 - i + MAX_RECENT_TASKS) % MAX_RECENT_TASKS;
+        memcpy(ids[i], g_recent_tasks[ring_idx], MAX_TASK_ID);
+    }
+    pthread_mutex_unlock(&g_recent_lock);
+
+    size_t pos = 0;
+    pos += (size_t)snprintf(out + pos, max_len - pos, "{\"tasks\":[");
+    bool first = true;
+    int limit = cnt < 32 ? cnt : 32;
+    time_t now = time(NULL);
+
+    for (int i = 0; i < limit && pos + 256 < max_len; i++)
+    {
+        unsigned int h = hash_task_id(ids[i]);
+        ResultStripe *st = &g_stripes[h % NUM_STRIPES];
+        unsigned int b = (h >> 6) % ENTRIES_PER_STRIPE;
+
+        TaskResult snap = {0};
+        bool found = false;
+        pthread_mutex_lock(&st->lock);
+        int idx = st->buckets[b];
+        while (idx != -1)
+        {
+            if (strncmp(st->entries[idx].taskId, ids[i], MAX_TASK_ID) == 0)
+            {
+                snap = st->entries[idx];
+                found = true;
+                break;
+            }
+            idx = st->entries[idx].next;
+        }
+        pthread_mutex_unlock(&st->lock);
+
+        if (!found) continue;
+
+        const char *st_str = "queued";
+        if (snap.status == TASK_STATUS_RUNNING) st_str = "running";
+        else if (snap.status == TASK_STATUS_COMPLETED) st_str = "completed";
+
+        long elapsed_s = 0;
+        if (snap.created_at > 0)
+        {
+            time_t end_t = snap.finished_at > 0 ? snap.finished_at : now;
+            elapsed_s = (long)(end_t >= snap.created_at ? (end_t - snap.created_at) : 0);
+        }
+
+        size_t log_bytes = snap.output_len;
+        char lp[256];
+        snprintf(lp, sizeof(lp), "/tmp/july_storage/%s/stdout.log", snap.taskId);
+        struct stat lst;
+        if (stat(lp, &lst) == 0) log_bytes = (size_t)lst.st_size;
+
+        if (!first) out[pos++] = ',';
+        pos += (size_t)snprintf(out + pos, max_len - pos,
+            "{\"task_id\":\"%s\",\"label\":\"", snap.taskId);
+        pos = json_escape_append(out, pos, max_len - 180, snap.label[0] ? snap.label : snap.taskId);
+        pos += (size_t)snprintf(out + pos, max_len - pos,
+            "\",\"type\":\"%s\",\"status\":\"%s\",\"exit_code\":%d,"
+            "\"artifacts_count\":%d,\"created_at\":%ld,\"elapsed_sec\":%ld,"
+            "\"log_bytes\":%zu,\"killed\":%s}",
+            snap.is_workflow ? "workflow" : "command",
+            st_str, snap.exit_code, snap.artifacts_count,
+            (long)snap.created_at, elapsed_s, log_bytes,
+            snap.killed ? "true" : "false");
+        first = false;
+    }
+
+    snprintf(out + pos, max_len - pos, "]}");
+}
+
+static bool extract_json_str_field(const char *json, size_t len, const char *target_key, char *out, size_t out_max)
+{
+    out[0] = '\0';
+    const char *end = json + len;
+    const char *p = skip_json_ws(json, end);
+    if (p >= end || *p != '{') return false;
+    p++;
+    while (p < end)
+    {
+        p = skip_json_ws(p, end);
+        if (p < end && *p == '}') break;
+        char key[64];
+        if (!parse_json_string(&p, end, key, sizeof(key))) break;
+        p = skip_json_ws(p, end);
+        if (p >= end || *p != ':') break;
+        p++;
+        p = skip_json_ws(p, end);
+        if (strcmp(key, target_key) == 0 && p < end && *p == '"')
+        {
+            return parse_json_string(&p, end, out, out_max);
+        }
+        p = skip_json_value(p, end);
+        p = skip_json_ws(p, end);
+        if (p < end && *p == ',') p++;
+    }
+    return false;
+}
+
 static int prepare_response(Connection *conn, size_t request_len)
 {
     conn->input[request_len] = '\0';
     conn->close_after_write = request_wants_close(conn->input, conn->header_bytes);
+
+    if (strncmp(conn->input, "OPTIONS ", 8) == 0)
+    {
+        const char *opt_resp =
+            "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Headers: Content-Type, X-July-Token, Authorization\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n";
+        write_response(conn, opt_resp, strlen(opt_resp));
+        conn->input_len -= request_len;
+        if (conn->input_len > 0)
+            memmove(conn->input, conn->input + request_len, conn->input_len);
+        conn->input[conn->input_len] = '\0';
+        return 0;
+    }
 
     // Authentication enforcement
     if (!is_request_authenticated(conn->input, conn->header_bytes))
@@ -1325,6 +2037,144 @@ static int prepare_response(Connection *conn, size_t request_len)
         if (strncmp(conn->input + 4, "/ ", 2) == 0)
         {
             write_response(conn, response_200, response_200_len);
+        }
+        else if (strncmp(conn->input + 4, "/stats ", 7) == 0 || strncmp(conn->input + 4, "/stats?", 7) == 0)
+        {
+            char stats_buf[OUTPUT_BUFFER_SIZE - 512];
+            build_stats_json(stats_buf, sizeof(stats_buf));
+            send_json_response(conn, 200, "OK", stats_buf);
+        }
+        else if (strncmp(conn->input + 4, "/tasks ", 7) == 0 || strncmp(conn->input + 4, "/tasks?", 7) == 0)
+        {
+            char tasks_buf[OUTPUT_BUFFER_SIZE - 512];
+            build_tasks_json(tasks_buf, sizeof(tasks_buf));
+            send_json_response(conn, 200, "OK", tasks_buf);
+        }
+        else if (strncmp(conn->input + 4, "/tmux/sessions ", 15) == 0 || strncmp(conn->input + 4, "/tmux/sessions?", 15) == 0)
+        {
+            const char *tmux_bin = find_tmux_bin();
+            const char *v_argv[] = {tmux_bin, "-V", NULL};
+            char ver_buf[128] = {0};
+            if (run_exec_capture(v_argv, ver_buf, sizeof(ver_buf)) != 0)
+            {
+                send_json_response(conn, 200, "OK", "{\"available\":false,\"sessions\":[]}");
+            }
+            else
+            {
+                char ls_buf[4096] = {0};
+                const char *ls_argv[] = {
+                    tmux_bin, "list-sessions", "-F",
+                    "#{session_name}\t#{session_windows}\t#{session_attached}\t#{pane_current_path}\t#{pane_current_command}",
+                    NULL
+                };
+                int rc = run_exec_capture(ls_argv, ls_buf, sizeof(ls_buf));
+                char resp[OUTPUT_BUFFER_SIZE];
+                size_t pos = 0;
+                pos += (size_t)snprintf(resp + pos, sizeof(resp) - pos, "{\"available\":true,\"sessions\":[");
+                if (rc == 0)
+                {
+                    bool first = true;
+                    char *line = ls_buf;
+                    while (line && *line && pos + 256 < sizeof(resp))
+                    {
+                        char *nl = strpbrk(line, "\r\n");
+                        if (nl) *nl++ = '\0';
+                        char *t1 = strchr(line, '\t');
+                        char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+                        char *t3 = t2 ? strchr(t2 + 1, '\t') : NULL;
+                        char *t4 = t3 ? strchr(t3 + 1, '\t') : NULL;
+                        if (t1 && t2 && t3 && t4)
+                        {
+                            *t1 = '\0'; *t2 = '\0'; *t3 = '\0'; *t4 = '\0';
+                            if (!first) resp[pos++] = ',';
+                            pos += (size_t)snprintf(resp + pos, sizeof(resp) - pos, "{\"name\":\"");
+                            pos = json_escape_append(resp, pos, sizeof(resp) - 128, line);
+                            pos += (size_t)snprintf(resp + pos, sizeof(resp) - pos, "\",\"windows\":%d,\"attached\":%d,\"cwd\":\"", atoi(t1 + 1), atoi(t2 + 1));
+                            pos = json_escape_append(resp, pos, sizeof(resp) - 96, t3 + 1);
+                            pos += (size_t)snprintf(resp + pos, sizeof(resp) - pos, "\",\"process\":\"");
+                            pos = json_escape_append(resp, pos, sizeof(resp) - 32, t4 + 1);
+                            pos += (size_t)snprintf(resp + pos, sizeof(resp) - pos, "\"}");
+                            first = false;
+                        }
+                        line = nl ? nl : NULL;
+                    }
+                }
+                snprintf(resp + pos, sizeof(resp) - pos, "]}");
+                send_json_response(conn, 200, "OK", resp);
+            }
+        }
+        else if (strncmp(conn->input + 4, "/tmux/pane ", 11) == 0 || strncmp(conn->input + 4, "/tmux/pane?", 11) == 0)
+        {
+            const char *tmux_bin = find_tmux_bin();
+            char raw_sess[64] = {0}, auto_str[16] = {0}, lines_str[16] = {0};
+            extract_query_param(conn->input, "session", raw_sess, sizeof(raw_sess));
+            extract_query_param(conn->input, "autostart", auto_str, sizeof(auto_str));
+            extract_query_param(conn->input, "lines", lines_str, sizeof(lines_str));
+
+            char sess[64];
+            sanitize_tmux_name(raw_sess, sess, sizeof(sess));
+            int nlines = atoi(lines_str);
+            if (nlines <= 0 || nlines > 400) nlines = 150;
+            char start_arg[24];
+            snprintf(start_arg, sizeof(start_arg), "-%d", nlines);
+
+            const char *has_argv[] = {tmux_bin, "has-session", "-t", sess, NULL};
+            bool exists = (run_exec_capture(has_argv, NULL, 0) == 0);
+            if (!exists && strcmp(auto_str, "1") == 0)
+            {
+                exists = tmux_ensure_session(tmux_bin, sess, NULL);
+            }
+
+            if (!exists)
+            {
+                char resp[256];
+                snprintf(resp, sizeof(resp), "{\"exists\":false,\"session\":\"%s\",\"cwd\":\"\",\"process\":\"\",\"content\":\"\"}", sess);
+                send_json_response(conn, 200, "OK", resp);
+            }
+            else
+            {
+                char cwd[512] = {0}, proc[128] = {0};
+                tmux_get_meta(tmux_bin, sess, cwd, sizeof(cwd), proc, sizeof(proc));
+
+                size_t raw_cap = 16384;
+                char *raw_buf = malloc(raw_cap);
+                if (!raw_buf)
+                {
+                    send_json_response(conn, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+                }
+                else
+                {
+                    const char *cap_argv[] = {tmux_bin, "capture-pane", "-p", "-J", "-S", start_arg, "-t", sess, NULL};
+                    run_exec_capture(cap_argv, raw_buf, raw_cap);
+                    size_t rlen = strlen(raw_buf);
+                    while (rlen > 0 && (raw_buf[rlen - 1] == '\n' || raw_buf[rlen - 1] == '\r'))
+                    {
+                        raw_buf[--rlen] = '\0';
+                    }
+
+                    size_t out_cap = rlen * 2 + 2048;
+                    char *out_buf = malloc(out_cap);
+                    if (!out_buf)
+                    {
+                        free(raw_buf);
+                        send_json_response(conn, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+                    }
+                    else
+                    {
+                        size_t pos = 0;
+                        pos += (size_t)snprintf(out_buf + pos, out_cap - pos, "{\"exists\":true,\"session\":\"%s\",\"cwd\":\"", sess);
+                        pos = json_escape_append(out_buf, pos, out_cap - 512, cwd);
+                        pos += (size_t)snprintf(out_buf + pos, out_cap - pos, "\",\"process\":\"");
+                        pos = json_escape_append(out_buf, pos, out_cap - 256, proc);
+                        pos += (size_t)snprintf(out_buf + pos, out_cap - pos, "\",\"content\":\"");
+                        pos = json_escape_append(out_buf, pos, out_cap - 16, raw_buf);
+                        snprintf(out_buf + pos, out_cap - pos, "\"}");
+                        send_json_response(conn, 200, "OK", out_buf);
+                        free(out_buf);
+                        free(raw_buf);
+                    }
+                }
+            }
         }
         else if (strncmp(conn->input + 4, "/stream/", 8) == 0)
         {
@@ -1397,10 +2247,12 @@ static int prepare_response(Connection *conn, size_t request_len)
                     if (!completed && delta == 0)
                     {
                         close(log_fd);
-                        char hdr[256];
+                        char hdr[512];
                         int hlen = snprintf(hdr, sizeof(hdr),
                             "HTTP/1.1 202 Accepted\r\n"
                             "Content-Type: text/plain\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Access-Control-Expose-Headers: X-Task-Status, X-Log-Offset, X-Task-Exit-Code, X-Artifacts-Count\r\n"
                             "X-Task-Status: Running\r\n"
                             "X-Log-Offset: %zu\r\n"
                             "Content-Length: 0\r\n"
@@ -1415,6 +2267,8 @@ static int prepare_response(Connection *conn, size_t request_len)
                         int hlen = snprintf(hdr, sizeof(hdr),
                             "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/plain\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Access-Control-Expose-Headers: X-Task-Status, X-Log-Offset, X-Task-Exit-Code, X-Artifacts-Count\r\n"
                             "X-Task-Status: %s\r\n"
                             "X-Log-Offset: %zu\r\n"
                             "X-Task-Exit-Code: %d\r\n"
@@ -1445,6 +2299,8 @@ static int prepare_response(Connection *conn, size_t request_len)
                         int hlen = snprintf(hdr, sizeof(hdr),
                             "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/plain\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Access-Control-Expose-Headers: X-Task-Status, X-Log-Offset, X-Task-Exit-Code, X-Artifacts-Count\r\n"
                             "X-Task-Status: %s\r\n"
                             "X-Log-Offset: %zu\r\n"
                             "X-Task-Exit-Code: %d\r\n"
@@ -1490,6 +2346,8 @@ static int prepare_response(Connection *conn, size_t request_len)
                         int hlen = snprintf(hdr, sizeof(hdr),
                             "HTTP/1.1 202 Accepted\r\n"
                             "Content-Type: text/plain\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Access-Control-Expose-Headers: X-Task-Status, X-Log-Offset, X-Task-Exit-Code, X-Artifacts-Count\r\n"
                             "X-Task-Status: Running\r\n"
                             "X-Log-Offset: %zu\r\n"
                             "Content-Length: 0\r\n"
@@ -1544,10 +2402,11 @@ static int prepare_response(Connection *conn, size_t request_len)
                     struct stat st;
                     fstat(mfd, &st);
                     bool want_close = request_wants_close(conn->input, conn->header_bytes);
-                    char hdr[256];
+                    char hdr[512];
                     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: application/json\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
                         "Content-Length: %zu\r\n"
                         "Connection: %s\r\n"
                         "\r\n",
@@ -1607,16 +2466,26 @@ static int prepare_response(Connection *conn, size_t request_len)
                     struct stat st;
                     fstat(art_fd, &st);
                     bool want_close = request_wants_close(conn->input, conn->header_bytes);
+                    const char *mime = "application/octet-stream";
+                    const char *disp = "attachment";
+                    size_t fnl = strlen(filename);
+                    if (fnl >= 4 && strcmp(filename + fnl - 4, ".png") == 0) { mime = "image/png"; disp = "inline"; }
+                    else if (fnl >= 5 && strcmp(filename + fnl - 5, ".json") == 0) { mime = "application/json"; disp = "inline"; }
+                    else if ((fnl >= 5 && strcmp(filename + fnl - 5, ".diff") == 0) ||
+                             (fnl >= 4 && strcmp(filename + fnl - 4, ".log") == 0) ||
+                             (fnl >= 4 && strcmp(filename + fnl - 4, ".txt") == 0)) { mime = "text/plain"; disp = "inline"; }
                     char hdr[512];
                     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/octet-stream\r\n"
+                        "Content-Type: %s\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
                         "Content-Length: %zu\r\n"
-                        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                        "Content-Disposition: %s; filename=\"%s\"\r\n"
                         "Connection: %s\r\n"
                         "\r\n",
-                        (size_t)st.st_size, filename,
-                        want_close ? "close" : "keep-alive");
+                        mime, (size_t)st.st_size,
+                        disp,
+                        filename, want_close ? "close" : "keep-alive");
 
 #if defined(__linux__)
                     int cork = 1;
@@ -1756,6 +2625,280 @@ static int prepare_response(Connection *conn, size_t request_len)
         else
         {
             write_response(conn, response_404, response_404_len);
+        }
+    }
+    else if (strncmp(conn->input, "POST /tasks/", 12) == 0 && strstr(conn->input + 12, "/kill"))
+    {
+        const char *id_start = conn->input + 12;
+        const char *km = strstr(id_start, "/kill");
+        size_t id_len = (size_t)(km - id_start);
+        char task_id[MAX_TASK_ID] = {0};
+        if (id_len >= sizeof(task_id)) id_len = sizeof(task_id) - 1;
+        memcpy(task_id, id_start, id_len);
+        task_id[id_len] = '\0';
+
+        bool killed = task_result_kill(task_id);
+        char jbuf[256];
+        snprintf(jbuf, sizeof(jbuf), "{\"task_id\":\"%s\",\"killed\":%s}", task_id, killed ? "true" : "false");
+        send_json_response(conn, 200, "OK", jbuf);
+    }
+    else if (strncmp(conn->input, "POST /api/ollama/wake ", 22) == 0)
+    {
+        Task task = {0};
+        task.type = TASK_TYPE_COMMAND;
+        snprintf(task.taskId, sizeof(task.taskId), "cmd_%ld_%d", (long)time(NULL), rand() % 100000);
+        snprintf(task.taskCommand, sizeof(task.taskCommand),
+                 "(curl -sf http://127.0.0.1:11434/api/tags >/dev/null || "
+                 "(nohup ollama serve >/tmp/july_ollama.log 2>&1 </dev/null & "
+                 "for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.2; done)) "
+                 "&& curl -sf http://127.0.0.1:11434/api/generate -d '{\"model\":\"qwen2.5-coder:7b\",\"prompt\":\"\",\"keep_alive\":\"10m\"}'");
+        if (enqueue_task(&task) == 0)
+        {
+            task_result_record_enqueued(task.taskId);
+            task_result_set_meta(task.taskId, "ollama:wake", false);
+            char jbuf[128];
+            snprintf(jbuf, sizeof(jbuf), "{\"task_id\":\"%s\",\"status\":\"queued\"}", task.taskId);
+            send_json_response(conn, 202, "Accepted", jbuf);
+        }
+        else
+        {
+            send_json_response(conn, 503, "Service Unavailable", "{\"error\":\"queue full\"}");
+        }
+    }
+    else if (strncmp(conn->input, "POST /api/ollama/unload ", 24) == 0)
+    {
+        Task task = {0};
+        task.type = TASK_TYPE_COMMAND;
+        snprintf(task.taskId, sizeof(task.taskId), "cmd_%ld_%d", (long)time(NULL), rand() % 100000);
+        snprintf(task.taskCommand, sizeof(task.taskCommand),
+                 "curl -s http://127.0.0.1:11434/api/generate -d '{\"model\":\"qwen2.5-coder:7b\",\"keep_alive\":0}'");
+        if (enqueue_task(&task) == 0)
+        {
+            task_result_record_enqueued(task.taskId);
+            task_result_set_meta(task.taskId, "ollama:unload", false);
+            char jbuf[128];
+            snprintf(jbuf, sizeof(jbuf), "{\"task_id\":\"%s\",\"status\":\"queued\"}", task.taskId);
+            send_json_response(conn, 202, "Accepted", jbuf);
+        }
+        else
+        {
+            send_json_response(conn, 503, "Service Unavailable", "{\"error\":\"queue full\"}");
+        }
+    }
+    else if (strncmp(conn->input, "POST /tmux/exec ", 16) == 0)
+    {
+        const char *body = conn->input + conn->header_bytes;
+        size_t body_len = request_len - conn->header_bytes;
+        char raw_sess[64] = {0}, command[2048] = {0}, cwd[512] = {0};
+        extract_json_str_field(body, body_len, "session", raw_sess, sizeof(raw_sess));
+        extract_json_str_field(body, body_len, "command", command, sizeof(command));
+        extract_json_str_field(body, body_len, "cwd", cwd, sizeof(cwd));
+
+        char sess[64];
+        sanitize_tmux_name(raw_sess, sess, sizeof(sess));
+        const char *tmux_bin = find_tmux_bin();
+
+        if (!tmux_ensure_session(tmux_bin, sess, cwd))
+        {
+            send_json_response(conn, 500, "Internal Server Error", "{\"error\":\"tmux unavailable or failed to create session\"}");
+        }
+        else
+        {
+            if (command[0] != '\0')
+            {
+                const char *send_argv[] = {tmux_bin, "send-keys", "-t", sess, "-l", "--", command, NULL};
+                run_exec_capture(send_argv, NULL, 0);
+                const char *ent_argv[] = {tmux_bin, "send-keys", "-t", sess, "Enter", NULL};
+                run_exec_capture(ent_argv, NULL, 0);
+                usleep(30000);
+            }
+            char cur_cwd[512] = {0}, cur_proc[128] = {0};
+            tmux_get_meta(tmux_bin, sess, cur_cwd, sizeof(cur_cwd), cur_proc, sizeof(cur_proc));
+
+            char jbuf[1024];
+            size_t pos = 0;
+            pos += (size_t)snprintf(jbuf + pos, sizeof(jbuf) - pos, "{\"ok\":true,\"session\":\"%s\",\"cwd\":\"", sess);
+            pos = json_escape_append(jbuf, pos, sizeof(jbuf) - 256, cur_cwd);
+            pos += (size_t)snprintf(jbuf + pos, sizeof(jbuf) - pos, "\",\"process\":\"");
+            pos = json_escape_append(jbuf, pos, sizeof(jbuf) - 16, cur_proc);
+            snprintf(jbuf + pos, sizeof(jbuf) - pos, "\"}");
+            send_json_response(conn, 200, "OK", jbuf);
+        }
+    }
+    else if (strncmp(conn->input, "POST /tmux/key ", 15) == 0)
+    {
+        const char *body = conn->input + conn->header_bytes;
+        size_t body_len = request_len - conn->header_bytes;
+        char raw_sess[64] = {0}, key[32] = {0};
+        extract_json_str_field(body, body_len, "session", raw_sess, sizeof(raw_sess));
+        extract_json_str_field(body, body_len, "key", key, sizeof(key));
+
+        char sess[64];
+        sanitize_tmux_name(raw_sess, sess, sizeof(sess));
+        const char *tmux_bin = find_tmux_bin();
+
+        if (strcmp(key, "kill-session") == 0)
+        {
+            const char *kill_argv[] = {tmux_bin, "kill-session", "-t", sess, NULL};
+            int rc = run_exec_capture(kill_argv, NULL, 0);
+            char jbuf[256];
+            snprintf(jbuf, sizeof(jbuf), "{\"ok\":%s,\"session\":\"%s\",\"key\":\"kill-session\"}", rc == 0 ? "true" : "false", sess);
+            send_json_response(conn, 200, "OK", jbuf);
+        }
+        else if (!is_allowed_tmux_key(key))
+        {
+            send_json_response(conn, 400, "Bad Request", "{\"error\":\"disallowed tmux key\"}");
+        }
+        else
+        {
+            const char *k_argv[] = {tmux_bin, "send-keys", "-t", sess, key, NULL};
+            int rc = run_exec_capture(k_argv, NULL, 0);
+            char jbuf[256];
+            snprintf(jbuf, sizeof(jbuf), "{\"ok\":%s,\"session\":\"%s\",\"key\":\"%s\"}", rc == 0 ? "true" : "false", sess, key);
+            send_json_response(conn, 200, "OK", jbuf);
+        }
+    }
+    else if (strncmp(conn->input, "POST /api/run ", 14) == 0)
+    {
+        const char *body = conn->input + conn->header_bytes;
+        size_t body_len = request_len - conn->header_bytes;
+        char mode[32] = "command";
+        char workspace[64] = "";
+        char command[1024] = "";
+        char prompt[3072] = "";
+        char owned[512] = "";
+        char model[128] = "qwen2.5-coder:7b";
+        char label[64] = "";
+
+        extract_json_str_field(body, body_len, "mode", mode, sizeof(mode));
+        if (mode[0] == '\0') strcpy(mode, "command");
+        extract_json_str_field(body, body_len, "workspace", workspace, sizeof(workspace));
+        extract_json_str_field(body, body_len, "command", command, sizeof(command));
+        extract_json_str_field(body, body_len, "prompt", prompt, sizeof(prompt));
+        extract_json_str_field(body, body_len, "owned", owned, sizeof(owned));
+        extract_json_str_field(body, body_len, "model", model, sizeof(model));
+        if (model[0] == '\0') strcpy(model, "qwen2.5-coder:7b");
+        extract_json_str_field(body, body_len, "label", label, sizeof(label));
+
+        char safe_ws[64] = "";
+        size_t wsi = 0;
+        for (size_t k = 0; workspace[k] && wsi < sizeof(safe_ws) - 1; k++)
+        {
+            char c = workspace[k];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-')
+                safe_ws[wsi++] = c;
+        }
+        safe_ws[wsi] = '\0';
+
+        char manifest_json[4096];
+        uint16_t env_flags = JULY_FLAG_NONE;
+        const char *attach_name = NULL;
+        const char *attach_data = NULL;
+        size_t attach_len = 0;
+
+        if (strcmp(mode, "julyos_boot") == 0)
+        {
+            env_flags = JULY_FLAG_WORKSPACE;
+            snprintf(manifest_json, sizeof(manifest_json),
+                "{\"name\":\"julyos\",\"options\":{\"timeout_sec\":90,\"kill_if_timeout\":true},"
+                "\"sandbox\":{\"network\":false,\"namespace\":false},"
+                "\"build\":[\"make clean\",\"make qemu-demo\"],"
+                "\"artifacts\":{\"required\":[\"julyos.elf\",\"julyos_screen.png\",\"serial_boot.log\"]}}");
+            if (label[0] == '\0') strcpy(label, "julyos:boot");
+        }
+        else if (strcmp(mode, "agent") == 0 && prompt[0] != '\0')
+        {
+            if (safe_ws[0] == '\0') strcpy(safe_ws, "july");
+            char esc_owned[640], esc_model[192];
+            json_escape_append(esc_owned, 0, sizeof(esc_owned), owned);
+            json_escape_append(esc_model, 0, sizeof(esc_model), model);
+            snprintf(manifest_json, sizeof(manifest_json),
+                "{\"name\":\"pocket-agent\",\"options\":{\"timeout_sec\":600,\"kill_if_timeout\":true},"
+                "\"sandbox\":{\"network\":true,\"namespace\":false},"
+                "\"env\":{\"JULY_BACKEND\":\"ollama\",\"OLLAMA_MODEL\":\"%s\",\"JULY_OWNED_FILES\":\"%s\"},"
+                "\"build\":[\"bash -c 'cp -r /tmp/july_workspaces/%s/. . 2>/dev/null || true; chmod +x harness/july_harness.sh && ./harness/july_harness.sh agent_brief.md'\"],"
+                "\"artifacts\":{\"required\":[\"agent_patch.diff\",\"agent_files.txt\",\"agent_run.log\"],\"on_failure\":[\"agent_run.log\"]}}",
+                esc_model, esc_owned, safe_ws);
+            attach_name = "agent_brief.md";
+            attach_data = prompt;
+            attach_len = strlen(prompt);
+            if (label[0] == '\0') snprintf(label, sizeof(label), "agent:%s", safe_ws);
+        }
+        else if (command[0] != '\0')
+        {
+            char esc_cmd[1536];
+            json_escape_append(esc_cmd, 0, sizeof(esc_cmd), command);
+            if (safe_ws[0] != '\0') env_flags = JULY_FLAG_WORKSPACE;
+            else strcpy(safe_ws, "pocket-cmd");
+            snprintf(manifest_json, sizeof(manifest_json),
+                "{\"name\":\"%s\",\"options\":{\"timeout_sec\":120,\"kill_if_timeout\":true},"
+                "\"sandbox\":{\"network\":true,\"namespace\":false},"
+                "\"build\":[\"%s\"]}",
+                safe_ws, esc_cmd);
+            if (label[0] == '\0') snprintf(label, sizeof(label), "%.48s", command);
+        }
+        else
+        {
+            send_json_response(conn, 400, "Bad Request", "{\"error\":\"Missing command or prompt\"}");
+            manifest_json[0] = '\0';
+        }
+
+        if (manifest_json[0] != '\0')
+        {
+            size_t mlen = strlen(manifest_json);
+            uint32_t nf = attach_name ? 1U : 0U;
+            size_t fnl = attach_name ? strlen(attach_name) : 0;
+            size_t env_sz = 12 + mlen + 4 + (attach_name ? (2 + fnl + 2 + 8 + attach_len) : 0);
+            uint8_t *env_buf = malloc(env_sz);
+            if (!env_buf)
+            {
+                send_json_response(conn, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+            }
+            else
+            {
+                env_buf[0] = 'J'; env_buf[1] = 'U'; env_buf[2] = 'L'; env_buf[3] = 'Y';
+                write_uint16_le(env_buf + 4, JULY_ENVELOPE_VERSION);
+                write_uint16_le(env_buf + 6, env_flags);
+                write_uint32_le(env_buf + 8, (uint32_t)mlen);
+                memcpy(env_buf + 12, manifest_json, mlen);
+                write_uint32_le(env_buf + 12 + mlen, nf);
+                if (attach_name)
+                {
+                    uint8_t *p = env_buf + 12 + mlen + 4;
+                    write_uint16_le(p, (uint16_t)fnl); p += 2;
+                    memcpy(p, attach_name, fnl); p += fnl;
+                    write_uint16_le(p, 0644); p += 2;
+                    write_uint64_le(p, (uint64_t)attach_len); p += 8;
+                    if (attach_len > 0) memcpy(p, attach_data, attach_len);
+                }
+
+                Task task = {0};
+                task.type = TASK_TYPE_WORKFLOW;
+                snprintf(task.taskId, sizeof(task.taskId), "wf_%ld_%d", (long)time(NULL), rand() % 100000);
+                snprintf(task.storageDir, sizeof(task.storageDir), "/tmp/july_storage/%s", task.taskId);
+                snprintf(task.sandboxDir, sizeof(task.sandboxDir), "/tmp/july_runs/%s", task.taskId);
+                mkdir_p(task.storageDir);
+
+                char envelope_path[512];
+                snprintf(envelope_path, sizeof(envelope_path), "%s/envelope.bin", task.storageDir);
+                int ef = open(envelope_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (ef >= 0) { write(ef, env_buf, env_sz); close(ef); }
+                free(env_buf);
+
+                if (enqueue_task(&task) == 0)
+                {
+                    task_result_record_enqueued(task.taskId);
+                    task_result_set_meta(task.taskId, label, true);
+                    char jbuf[256];
+                    snprintf(jbuf, sizeof(jbuf), "{\"task_id\":\"%s\",\"status\":\"queued\"}", task.taskId);
+                    send_json_response(conn, 202, "Accepted", jbuf);
+                }
+                else
+                {
+                    send_json_response(conn, 503, "Service Unavailable", "{\"error\":\"queue full\"}");
+                }
+            }
         }
     }
     else if (conn->input[0] == 'P' && strncmp(conn->input, "POST /workflow ", 15) == 0)

@@ -22,6 +22,9 @@
     "dispatch",
     "picture",
     "app",
-    "dist"
+    "dist",
+    "node_modules",
+    "july-pocket",
+    ".expo"
   ]
 }
