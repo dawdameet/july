@@ -1,0 +1,30 @@
+{
+  "name": "install-july-harness",
+  "options": {
+    "timeout_sec": 180,
+    "kill_if_timeout": true
+  },
+  "sandbox": {
+    "network": true,
+    "namespace": false,
+    "memory_mb": 2048
+  },
+  "pre_flight": {
+    "check_tools": [
+      "node",
+      "npm",
+      "git"
+    ],
+    "deps": [
+      "bash -c 'VENV_DIR=\"$HOME/venv\"; [ -d \"$VENV_DIR/bin\" ] || { echo \"Missing $VENV_DIR\"; exit 1; }; if [ ! -x \"$VENV_DIR/bin/gemini\" ]; then mkdir -p \"$VENV_DIR/gemini-cli\" && npm install --no-audit --no-fund --prefix \"$VENV_DIR/gemini-cli\" @google/gemini-cli && ln -sf ../gemini-cli/node_modules/.bin/gemini \"$VENV_DIR/bin/gemini\"; fi'"
+    ]
+  },
+  "build": [
+    "bash -c 'VENV_DIR=\"$HOME/venv\"; install -m 0755 harness/july_harness.sh \"$VENV_DIR/bin/july-harness\"'",
+    "bash -c 'source \"$HOME/venv/bin/activate\" && echo \"venv python: $(which python3)\" && echo \"gemini bin:  $(which gemini)\" && echo \"gemini ver:  $(gemini --version)\" && echo \"harness bin: $(which july-harness)\"'"
+  ],
+  "artifacts": {
+    "required": []
+  }
+}
+
