@@ -516,21 +516,6 @@ static int stream_task_conn(int *sock_ptr, const char *host, int port, const cha
         "\r\n",
         task_id, *log_offset, host, port, auth_hdr);
 
-    if (write(sock, request, req_len) != req_len)
-    {
-        close(sock);
-        if (sock_ptr) *sock_ptr = -1;
-        sock = connect_to_server(host, port);
-        if (sock < 0) return -1;
-        if (sock_ptr) *sock_ptr = sock;
-        if (write(sock, request, req_len) != req_len)
-        {
-            close(sock);
-            if (sock_ptr) *sock_ptr = -1;
-            return -1;
-        }
-    }
-
     size_t capacity = RESPONSE_BUF_SIZE;
     size_t total_read = 0;
     char *buf = malloc(capacity);
@@ -542,26 +527,61 @@ static int stream_task_conn(int *sock_ptr, const char *host, int port, const cha
     }
 
     char *header_end = NULL;
-    while (!header_end)
+    for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (total_read >= capacity - 1)
+        total_read = 0;
+        header_end = NULL;
+
+        if (write(sock, request, req_len) != req_len)
         {
-            capacity *= 2;
-            char *nb = realloc(buf, capacity);
-            if (!nb)
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+            sock = connect_to_server(host, port);
+            if (sock < 0) { free(buf); return -1; }
+            if (sock_ptr) *sock_ptr = sock;
+            if (write(sock, request, req_len) != req_len)
             {
                 free(buf);
                 close(sock);
                 if (sock_ptr) *sock_ptr = -1;
                 return -1;
             }
-            buf = nb;
         }
-        ssize_t n = read(sock, buf + total_read, capacity - 1 - total_read);
-        if (n <= 0) break;
-        total_read += (size_t)n;
-        buf[total_read] = '\0';
-        header_end = strstr(buf, "\r\n\r\n");
+
+        while (!header_end)
+        {
+            if (total_read >= capacity - 1)
+            {
+                capacity *= 2;
+                char *nb = realloc(buf, capacity);
+                if (!nb)
+                {
+                    free(buf);
+                    close(sock);
+                    if (sock_ptr) *sock_ptr = -1;
+                    return -1;
+                }
+                buf = nb;
+            }
+            ssize_t n = read(sock, buf + total_read, capacity - 1 - total_read);
+            if (n <= 0) break;
+            total_read += (size_t)n;
+            buf[total_read] = '\0';
+            header_end = strstr(buf, "\r\n\r\n");
+        }
+
+        if (header_end)
+            break;
+
+        // Server closed keep-alive socket before responding; reconnect once cleanly
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        if (attempt == 0)
+        {
+            sock = connect_to_server(host, port);
+            if (sock < 0) { free(buf); return -1; }
+            if (sock_ptr) *sock_ptr = sock;
+        }
     }
 
     if (!header_end)

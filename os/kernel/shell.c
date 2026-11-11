@@ -8,7 +8,7 @@
 
 static void run_cmd(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
-        kprintf("Commands: help, mem, ps, ls, uptime, halt\n");
+        kprintf("Commands: help, mem, ps, ls, uptime, halt, uname\n");
     } else if (strcmp(cmd, "mem") == 0) {
         kmalloc_stats_t st;
         kmalloc_get_stats(&st);
@@ -35,6 +35,8 @@ static void run_cmd(const char *cmd) {
     } else if (strcmp(cmd, "halt") == 0) {
         kprintf("[JULYOS] ACPI shutdown requested.\n");
         arch_qemu_exit(0);
+    } else if (strcmp(cmd, "uname") == 0) {
+        kprintf("JulyOS 0.1 x86_64 LongMode\n");
     } else if (cmd[0] != '\0') {
         kprintf("Unknown command: %s\n", cmd);
     }

@@ -46,10 +46,11 @@ def collect_project_files(ignore_patterns: list[str]) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Dispatch a subtask to the Fedora agent harness via July")
     parser.add_argument("brief", nargs="?", default="", help="Path to the task brief markdown/text file")
-    parser.add_argument("--backend", choices=["ollama", "gemini"], default="ollama", help="LLM backend on Fedora (default: ollama)")
+    parser.add_argument("--backend", choices=["ollama", "opencode", "gemini"], default="ollama", help="LLM backend on Fedora (default: ollama)")
     parser.add_argument("--target", default="", help="Target host:port (defaults to .julyconfig target)")
-    parser.add_argument("--timeout", type=int, default=0, help="Execution timeout in seconds (default: 600 ollama, 240 gemini)")
+    parser.add_argument("--timeout", type=int, default=0, help="Execution timeout in seconds (default: 600 ollama/opencode, 240 gemini)")
     parser.add_argument("--model", default="", help="Optional model override (e.g. qwen2.5-coder:7b or gemini-2.5-flash)")
+    parser.add_argument("--owned", default="", help="Comma-separated file paths leased to the remote agent")
     parser.add_argument("--name", default="july-agent-task", help="Workflow name")
     parser.add_argument("--out-dir", default=".july/agent_out", help="Directory to store downloaded artifacts")
     parser.add_argument("--async", dest="async_mode", action="store_true", help="Dispatch asynchronously and return JULY_ASYNC_TASK_ID immediately")
@@ -88,6 +89,8 @@ def main() -> int:
     else:
         if args.model:
             env_map["OLLAMA_MODEL"] = args.model
+        if args.owned:
+            env_map["JULY_OWNED_FILES"] = args.owned
 
     if not args.brief:
         print("[!] Brief file is required unless --wait <task_id> is passed.", file=sys.stderr)

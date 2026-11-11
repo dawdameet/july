@@ -1409,7 +1409,7 @@ static int prepare_response(Connection *conn, size_t request_len)
                             new_offset, want_close ? "close" : "keep-alive");
                         write_dynamic_response(conn, hdr, (size_t)hlen, "", 0);
                     }
-                    else
+                    else if (delta <= sizeof(conn->output) - 512)
                     {
                         char hdr[512];
                         int hlen = snprintf(hdr, sizeof(hdr),
@@ -1425,6 +1425,35 @@ static int prepare_response(Connection *conn, size_t request_len)
                             completed ? "Completed" : "Running",
                             new_offset, exit_code, art_count, delta,
                             want_close ? "close" : "keep-alive");
+                        char slice_buf[OUTPUT_BUFFER_SIZE];
+                        size_t got = 0;
+                        if (delta > 0 && lseek(log_fd, (off_t)req_offset, SEEK_SET) >= 0)
+                        {
+                            while (got < delta)
+                            {
+                                ssize_t rn = read(log_fd, slice_buf + got, delta - got);
+                                if (rn <= 0) break;
+                                got += (size_t)rn;
+                            }
+                        }
+                        close(log_fd);
+                        write_dynamic_response(conn, hdr, (size_t)hlen, slice_buf, got);
+                    }
+                    else
+                    {
+                        char hdr[512];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: %s\r\n"
+                            "X-Log-Offset: %zu\r\n"
+                            "X-Task-Exit-Code: %d\r\n"
+                            "X-Artifacts-Count: %d\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: close\r\n"
+                            "\r\n",
+                            completed ? "Completed" : "Running",
+                            new_offset, exit_code, art_count, delta);
 #if defined(__linux__)
                         int cork = 1;
                         setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
@@ -1440,7 +1469,7 @@ static int prepare_response(Connection *conn, size_t request_len)
                         cork = 0;
                         setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 #endif
-                        conn->close_after_write = want_close;
+                        conn->close_after_write = true;
                         conn->output_len = 0;
                         conn->output_offset = 0;
                         return 1;

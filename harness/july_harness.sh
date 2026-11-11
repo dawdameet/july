@@ -29,6 +29,16 @@ fi
 
 AGENT_RC=0
 if [ "$BACKEND" = "ollama" ]; then
+    if [ ! -f harness/ollama_agent.py ]; then
+        echo "[!] Missing harness/ollama_agent.py" >&2
+        exit 1
+    fi
+    echo "[*] Spawning lean Ollama /api/chat agent (${OLLAMA_MODEL:-qwen2.5-coder:7b}) in $(pwd)..."
+    set +e
+    python3 -u harness/ollama_agent.py "$BRIEF_FILE" 2>&1 | tee agent_run.log
+    AGENT_RC=${PIPESTATUS[0]}
+    set -e
+elif [ "$BACKEND" = "opencode" ]; then
     if ! command -v opencode >/dev/null 2>&1; then
         echo "[!] 'opencode' CLI missing in $VENV_DIR/bin. Install opencode-ai first." >&2
         exit 1
@@ -77,7 +87,6 @@ elif [ "$BACKEND" = "gemini" ]; then
         MODEL_ARGS=(-m "$GEMINI_MODEL")
     fi
 
-    # Isolate gemini-cli home so global ~/.gemini/settings.json (oauth-personal) doesn't override GEMINI_API_KEY
     export GEMINI_CLI_HOME="/tmp/july_gemini_home"
     mkdir -p "$GEMINI_CLI_HOME/.gemini"
     cat > "$GEMINI_CLI_HOME/.gemini/settings.json" <<'EOF'
@@ -99,7 +108,7 @@ EOF
     AGENT_RC=${PIPESTATUS[0]}
     set -e
 else
-    echo "[!] Unknown JULY_BACKEND: $BACKEND (expected 'ollama' or 'gemini')" >&2
+    echo "[!] Unknown JULY_BACKEND: $BACKEND (expected 'ollama', 'opencode', or 'gemini')" >&2
     exit 1
 fi
 
