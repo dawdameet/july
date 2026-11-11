@@ -2,6 +2,7 @@
 *.profraw
 *.profdata
 app
+!july-pocket/src/app/
 server
 dispatcher
 dispatch
