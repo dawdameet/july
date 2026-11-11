@@ -27,6 +27,8 @@
 #include <dirent.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <time.h>
 
 #if defined(__APPLE__)
@@ -74,6 +76,26 @@ static inline bool is_request_authenticated(const char *headers, size_t header_l
         size_t tok_len = eol ? (size_t)(eol - auth) : strlen(auth);
         if (tok_len == strlen(g_auth_token) && strncmp(auth, g_auth_token, tok_len) == 0)
             return true;
+    }
+
+    // 3. For WebSocket upgrades (/ws/...), allow ?token=<token> query parameter
+    if (strncmp(headers, "GET /ws/", 8) == 0)
+    {
+        const char *eol = strpbrk(headers, "\r\n");
+        const char *q = memchr(headers, '?', eol ? (size_t)(eol - headers) : header_len);
+        if (q && (!eol || q < eol))
+        {
+            const char *t1 = strstr(q, "?token=");
+            const char *t2 = strstr(q, "&token=");
+            const char *tp = (t1 && (!eol || t1 < eol)) ? (t1 + 7) : ((t2 && (!eol || t2 < eol)) ? (t2 + 7) : NULL);
+            if (tp)
+            {
+                const char *tend = strpbrk(tp, "& \r\n");
+                size_t tok_len = tend ? (size_t)(tend - tp) : strlen(tp);
+                if (tok_len == strlen(g_auth_token) && strncmp(tp, g_auth_token, tok_len) == 0)
+                    return true;
+            }
+        }
     }
 
     return false;
@@ -1254,6 +1276,19 @@ static inline void close_connection(int kq, Connection *conn)
         free(conn->input);
     free(conn);
 }
+
+static inline void detach_connection(int kq, Connection *conn)
+{
+    if (!conn)
+        return;
+    struct kevent changes[2];
+    EV_SET(&changes[0], conn->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    EV_SET(&changes[1], conn->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent(kq, changes, 2, NULL, 0, NULL);
+    if (conn->input)
+        free(conn->input);
+    free(conn);
+}
 #else
 static inline int update_interest(int epfd, Connection *conn, uint32_t events)
 {
@@ -1269,6 +1304,16 @@ static inline void close_connection(int epfd, Connection *conn)
         return;
     epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
     close(conn->fd);
+    if (conn->input)
+        free(conn->input);
+    free(conn);
+}
+
+static inline void detach_connection(int epfd, Connection *conn)
+{
+    if (!conn)
+        return;
+    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL);
     if (conn->input)
         free(conn->input);
     free(conn);
@@ -1891,6 +1936,399 @@ static bool is_allowed_tmux_key(const char *k)
     return false;
 }
 
+static inline uint32_t ws_rol32(uint32_t v, int bits)
+{
+    return (v << bits) | (v >> (32 - bits));
+}
+
+static void ws_sha1(const uint8_t *msg, size_t len, uint8_t digest[20])
+{
+    uint32_t h0 = 0x67452301U, h1 = 0xEFCDAB89U, h2 = 0x98BADCFEU, h3 = 0x10325476U, h4 = 0xC3D2E1F0U;
+    size_t padded = ((len + 8) / 64 + 1) * 64;
+    uint8_t *buf = calloc(1, padded);
+    if (!buf) return;
+    memcpy(buf, msg, len);
+    buf[len] = 0x80;
+    uint64_t bit_len = (uint64_t)len * 8ULL;
+    for (int i = 0; i < 8; i++)
+        buf[padded - 1 - (size_t)i] = (uint8_t)((bit_len >> (i * 8)) & 0xFFU);
+
+    for (size_t off = 0; off < padded; off += 64)
+    {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+        {
+            const uint8_t *b = buf + off + (size_t)(i * 4);
+            w[i] = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+        }
+        for (int i = 16; i < 80; i++)
+            w[i] = ws_rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (int i = 0; i < 80; i++)
+        {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999U; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1U; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCU; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6U; }
+            uint32_t tmp = ws_rol32(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = ws_rol32(b, 30); b = a; a = tmp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+    free(buf);
+    uint32_t hs[5] = {h0, h1, h2, h3, h4};
+    for (int i = 0; i < 5; i++)
+    {
+        digest[i * 4 + 0] = (uint8_t)((hs[i] >> 24) & 0xFFU);
+        digest[i * 4 + 1] = (uint8_t)((hs[i] >> 16) & 0xFFU);
+        digest[i * 4 + 2] = (uint8_t)((hs[i] >> 8) & 0xFFU);
+        digest[i * 4 + 3] = (uint8_t)(hs[i] & 0xFFU);
+    }
+}
+
+static void ws_base64_encode(const uint8_t *in, size_t len, char *out)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 3)
+    {
+        uint32_t n = ((uint32_t)in[i] << 16);
+        if (i + 1 < len) n |= ((uint32_t)in[i + 1] << 8);
+        if (i + 2 < len) n |= (uint32_t)in[i + 2];
+        out[j++] = tbl[(n >> 18) & 63U];
+        out[j++] = tbl[(n >> 12) & 63U];
+        out[j++] = (i + 1 < len) ? tbl[(n >> 6) & 63U] : '=';
+        out[j++] = (i + 2 < len) ? tbl[n & 63U] : '=';
+    }
+    out[j] = '\0';
+}
+
+static void ws_compute_accept(const char *client_key, char *accept_out)
+{
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char combo[256];
+    snprintf(combo, sizeof(combo), "%s%s", client_key, guid);
+    uint8_t dig[20] = {0};
+    ws_sha1((const uint8_t *)combo, strlen(combo), dig);
+    ws_base64_encode(dig, 20, accept_out);
+}
+
+static bool ws_write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n > 0)
+        {
+            sent += (size_t)n;
+        }
+        else if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            if (poll(&pfd, 1, 2000) <= 0) return false;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ws_send_frame(int fd, uint8_t opcode, const uint8_t *data, size_t len)
+{
+    uint8_t hdr[10];
+    size_t hlen = 0;
+    hdr[0] = (uint8_t)(0x80U | (opcode & 0x0FU));
+    if (len < 126)
+    {
+        hdr[1] = (uint8_t)len;
+        hlen = 2;
+    }
+    else if (len <= 0xFFFFU)
+    {
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)((len >> 8) & 0xFFU);
+        hdr[3] = (uint8_t)(len & 0xFFU);
+        hlen = 4;
+    }
+    else
+    {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++)
+            hdr[2 + i] = (uint8_t)(((uint64_t)len >> ((7 - i) * 8)) & 0xFFU);
+        hlen = 10;
+    }
+    if (!ws_write_all(fd, hdr, hlen)) return false;
+    if (len > 0 && data && !ws_write_all(fd, data, len)) return false;
+    return true;
+}
+
+typedef struct {
+    int ws_fd;
+    char session[64];
+    int cols;
+    int rows;
+} WsPtyArgs;
+
+static void *ws_pty_worker(void *arg)
+{
+    WsPtyArgs *w = (WsPtyArgs *)arg;
+    int ws_fd = w->ws_fd;
+    char sess[64];
+    safe_copy_str(sess, sizeof(sess), w->session);
+    int cols = w->cols;
+    int rows = w->rows;
+    free(w);
+
+    int master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master_fd < 0 || grantpt(master_fd) != 0 || unlockpt(master_fd) != 0)
+    {
+        if (master_fd >= 0) close(master_fd);
+        ws_send_frame(ws_fd, 0x08, NULL, 0);
+        close(ws_fd);
+        return NULL;
+    }
+
+    char slave_name[128] = {0};
+    const char *sname = ptsname(master_fd);
+    if (!sname)
+    {
+        close(master_fd);
+        ws_send_frame(ws_fd, 0x08, NULL, 0);
+        close(ws_fd);
+        return NULL;
+    }
+    safe_copy_str(slave_name, sizeof(slave_name), sname);
+
+    struct winsize wsz = {0};
+    wsz.ws_col = (unsigned short)cols;
+    wsz.ws_row = (unsigned short)rows;
+    ioctl(master_fd, TIOCSWINSZ, &wsz);
+
+    const char *tmux_bin = find_tmux_bin();
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(master_fd);
+        ws_send_frame(ws_fd, 0x08, NULL, 0);
+        close(ws_fd);
+        return NULL;
+    }
+
+    if (pid == 0)
+    {
+        setsid();
+        int slave_fd = open(slave_name, O_RDWR);
+        if (slave_fd < 0) _exit(1);
+        ioctl(slave_fd, TIOCSCTTY, 0);
+        dup2(slave_fd, STDIN_FILENO);
+        dup2(slave_fd, STDOUT_FILENO);
+        dup2(slave_fd, STDERR_FILENO);
+        if (slave_fd > 2) close(slave_fd);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+
+        setenv("TERM", "xterm-256color", 1);
+        setenv("COLORTERM", "truecolor", 1);
+        const char *home = getenv("HOME");
+        if (home && home[0]) (void)chdir(home);
+        const char *argv[] = {tmux_bin, "new-session", "-A", "-s", sess, NULL};
+        execvp(tmux_bin, (char *const *)argv);
+        _exit(127);
+    }
+
+    int mfl = fcntl(master_fd, F_GETFL, 0);
+    if (mfl >= 0) fcntl(master_fd, F_SETFL, mfl | O_NONBLOCK);
+    int wfl = fcntl(ws_fd, F_GETFL, 0);
+    if (wfl >= 0) fcntl(ws_fd, F_SETFL, wfl | O_NONBLOCK);
+
+    uint8_t rx_buf[16384];
+    size_t rx_len = 0;
+    bool alive = true;
+
+    while (alive)
+    {
+        struct pollfd pfds[2] = {
+            {.fd = master_fd, .events = POLLIN, .revents = 0},
+            {.fd = ws_fd, .events = POLLIN, .revents = 0}
+        };
+        int prc = poll(pfds, 2, 10000);
+        if (prc < 0)
+        {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (pfds[0].revents & POLLIN)
+        {
+            uint8_t pbuf[4096];
+            for (;;)
+            {
+                ssize_t n = read(master_fd, pbuf, sizeof(pbuf));
+                if (n > 0)
+                {
+                    if (!ws_send_frame(ws_fd, 0x02, pbuf, (size_t)n))
+                    {
+                        alive = false;
+                        break;
+                    }
+                }
+                else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                {
+                    break;
+                }
+                else if (n < 0 && errno == EINTR)
+                {
+                    continue;
+                }
+                else
+                {
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        if (alive && (pfds[0].revents & (POLLERR | POLLHUP)))
+        {
+            alive = false;
+        }
+
+        if (alive && (pfds[1].revents & POLLIN))
+        {
+            for (;;)
+            {
+                if (rx_len >= sizeof(rx_buf)) { alive = false; break; }
+                ssize_t n = read(ws_fd, rx_buf + rx_len, sizeof(rx_buf) - rx_len);
+                if (n > 0)
+                {
+                    rx_len += (size_t)n;
+                }
+                else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                {
+                    break;
+                }
+                else if (n < 0 && errno == EINTR)
+                {
+                    continue;
+                }
+                else
+                {
+                    alive = false;
+                    break;
+                }
+            }
+
+            size_t off = 0;
+            while (alive && off + 2 <= rx_len)
+            {
+                uint8_t b0 = rx_buf[off];
+                uint8_t b1 = rx_buf[off + 1];
+                uint8_t op = b0 & 0x0FU;
+                bool masked = (b1 & 0x80U) != 0;
+                uint64_t plen = b1 & 0x7FU;
+                size_t hdr_sz = 2;
+                if (plen == 126)
+                {
+                    if (off + 4 > rx_len) break;
+                    plen = ((uint64_t)rx_buf[off + 2] << 8) | (uint64_t)rx_buf[off + 3];
+                    hdr_sz = 4;
+                }
+                else if (plen == 127)
+                {
+                    if (off + 10 > rx_len) break;
+                    plen = 0;
+                    for (int k = 0; k < 8; k++)
+                        plen = (plen << 8) | (uint64_t)rx_buf[off + 2 + k];
+                    hdr_sz = 10;
+                }
+                if (plen > sizeof(rx_buf) - 16) { alive = false; break; }
+                if (masked) hdr_sz += 4;
+                if (off + hdr_sz + (size_t)plen > rx_len) break;
+
+                uint8_t *payload = rx_buf + off + hdr_sz;
+                if (masked)
+                {
+                    uint8_t *mask = payload - 4;
+                    for (size_t k = 0; k < (size_t)plen; k++)
+                        payload[k] ^= mask[k & 3U];
+                }
+
+                if (op == 0x08)
+                {
+                    ws_send_frame(ws_fd, 0x08, NULL, 0);
+                    alive = false;
+                    off += hdr_sz + (size_t)plen;
+                    break;
+                }
+                else if (op == 0x09)
+                {
+                    ws_send_frame(ws_fd, 0x0A, payload, (size_t)plen);
+                }
+                else if ((op == 0x01 || op == 0x02 || op == 0x00) && plen > 0)
+                {
+                    if (plen >= 5 && memcmp(payload, "\x01R:", 3) == 0 && plen < 64)
+                    {
+                        char rbuf[64];
+                        memcpy(rbuf, payload + 3, (size_t)plen - 3);
+                        rbuf[(size_t)plen - 3] = '\0';
+                        int nc = 0, nr = 0;
+                        if (sscanf(rbuf, "%d,%d", &nc, &nr) == 2 && nc >= 20 && nc <= 300 && nr >= 8 && nr <= 120)
+                        {
+                            struct winsize nws = {0};
+                            nws.ws_col = (unsigned short)nc;
+                            nws.ws_row = (unsigned short)nr;
+                            ioctl(master_fd, TIOCSWINSZ, &nws);
+                        }
+                    }
+                    else
+                    {
+                        ws_write_all(master_fd, payload, (size_t)plen);
+                    }
+                }
+                off += hdr_sz + (size_t)plen;
+            }
+            if (off > 0)
+            {
+                if (off < rx_len) memmove(rx_buf, rx_buf + off, rx_len - off);
+                rx_len -= off;
+            }
+        }
+        if (alive && (pfds[1].revents & (POLLERR | POLLHUP)))
+        {
+            alive = false;
+        }
+    }
+
+    ws_send_frame(ws_fd, 0x08, NULL, 0);
+    close(ws_fd);
+    close(master_fd);
+
+    int wst = 0;
+    if (waitpid(pid, &wst, WNOHANG) == 0)
+    {
+        kill(pid, SIGHUP);
+        for (int t = 0; t < 20; t++)
+        {
+            if (waitpid(pid, &wst, WNOHANG) != 0) break;
+            usleep(10000);
+        }
+        if (waitpid(pid, &wst, WNOHANG) == 0)
+        {
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &wst, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    return NULL;
+}
+
 static void build_tasks_json(char *out, size_t max_len)
 {
     pthread_mutex_lock(&g_recent_lock);
@@ -2037,6 +2475,76 @@ static int prepare_response(Connection *conn, size_t request_len)
         if (strncmp(conn->input + 4, "/ ", 2) == 0)
         {
             write_response(conn, response_200, response_200_len);
+        }
+        else if (strncmp(conn->input + 4, "/ws/tmux ", 9) == 0 || strncmp(conn->input + 4, "/ws/tmux?", 9) == 0)
+        {
+            const char *ws_key_hdr = strcasestr(conn->input, "Sec-WebSocket-Key:");
+            if (!ws_key_hdr || (size_t)(ws_key_hdr - conn->input) >= conn->header_bytes)
+            {
+                send_json_response(conn, 400, "Bad Request", "{\"error\":\"Missing Sec-WebSocket-Key\"}");
+            }
+            else
+            {
+                ws_key_hdr += 18;
+                while (*ws_key_hdr == ' ' || *ws_key_hdr == '\t') ws_key_hdr++;
+                const char *keol = strpbrk(ws_key_hdr, "\r\n");
+                char ws_key[128] = {0};
+                size_t klen = keol ? (size_t)(keol - ws_key_hdr) : 0;
+                if (klen >= sizeof(ws_key)) klen = sizeof(ws_key) - 1;
+                memcpy(ws_key, ws_key_hdr, klen);
+                ws_key[klen] = '\0';
+
+                char accept_key[64] = {0};
+                ws_compute_accept(ws_key, accept_key);
+
+                char raw_sess[64] = {0}, cols_s[16] = {0}, rows_s[16] = {0};
+                extract_query_param(conn->input, "session", raw_sess, sizeof(raw_sess));
+                extract_query_param(conn->input, "cols", cols_s, sizeof(cols_s));
+                extract_query_param(conn->input, "rows", rows_s, sizeof(rows_s));
+
+                WsPtyArgs *wargs = calloc(1, sizeof(WsPtyArgs));
+                if (!wargs)
+                {
+                    send_json_response(conn, 500, "Internal Server Error", "{\"error\":\"oom\"}");
+                }
+                else
+                {
+                    wargs->ws_fd = conn->fd;
+                    sanitize_tmux_name(raw_sess, wargs->session, sizeof(wargs->session));
+                    int c = atoi(cols_s);
+                    int r = atoi(rows_s);
+                    wargs->cols = (c >= 20 && c <= 300) ? c : 52;
+                    wargs->rows = (r >= 8 && r <= 120) ? r : 24;
+
+                    char hs[256];
+                    int hlen = snprintf(hs, sizeof(hs),
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Sec-WebSocket-Accept: %s\r\n"
+                        "\r\n",
+                        accept_key);
+
+                    if (!ws_write_all(conn->fd, hs, (size_t)hlen))
+                    {
+                        free(wargs);
+                        return 1;
+                    }
+
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                    pthread_t tid;
+                    if (pthread_create(&tid, &attr, ws_pty_worker, wargs) != 0)
+                    {
+                        pthread_attr_destroy(&attr);
+                        free(wargs);
+                        return 1;
+                    }
+                    pthread_attr_destroy(&attr);
+                    return 2;
+                }
+            }
         }
         else if (strncmp(conn->input + 4, "/stats ", 7) == 0 || strncmp(conn->input + 4, "/stats?", 7) == 0)
         {
@@ -3348,6 +3856,11 @@ int main(int argc, char **argv)
                     else if (request_len > 0)
                     {
                         int p_res = prepare_response(conn, (size_t)request_len);
+                        if (p_res == 2)
+                        {
+                            detach_connection(kq, conn);
+                            continue;
+                        }
                         if (p_res == 1)
                         {
                             close_connection(kq, conn);
@@ -3372,6 +3885,11 @@ int main(int argc, char **argv)
                             if (next_len > 0)
                             {
                                 int p_res2 = prepare_response(conn, (size_t)next_len);
+                                if (p_res2 == 2)
+                                {
+                                    detach_connection(kq, conn);
+                                    continue;
+                                }
                                 if (p_res2 == 1)
                                 {
                                     close_connection(kq, conn);
@@ -3416,6 +3934,11 @@ int main(int argc, char **argv)
                     if (next_len > 0)
                     {
                         int p_res = prepare_response(conn, (size_t)next_len);
+                        if (p_res == 2)
+                        {
+                            detach_connection(kq, conn);
+                            continue;
+                        }
                         if (p_res == 1)
                         {
                             close_connection(kq, conn);
@@ -3603,6 +4126,11 @@ int main(int argc, char **argv)
                     else if (request_len > 0)
                     {
                         int p_res = prepare_response(conn, (size_t)request_len);
+                        if (p_res == 2)
+                        {
+                            detach_connection(epfd, conn);
+                            continue;
+                        }
                         if (p_res == 1)
                         {
                             close_connection(epfd, conn);
@@ -3627,6 +4155,11 @@ int main(int argc, char **argv)
                             if (next_len > 0)
                             {
                                 int p_res2 = prepare_response(conn, (size_t)next_len);
+                                if (p_res2 == 2)
+                                {
+                                    detach_connection(epfd, conn);
+                                    continue;
+                                }
                                 if (p_res2 == 1)
                                 {
                                     close_connection(epfd, conn);
@@ -3669,6 +4202,11 @@ int main(int argc, char **argv)
                     if (next_len > 0)
                     {
                         int p_res = prepare_response(conn, (size_t)next_len);
+                        if (p_res == 2)
+                        {
+                            detach_connection(epfd, conn);
+                            continue;
+                        }
                         if (p_res == 1)
                         {
                             close_connection(epfd, conn);
