@@ -38,7 +38,8 @@ function DiffView({ diff }: { diff: string }) {
 }
 
 export default function ArtifactsScreen() {
-  const { activeNode, tasks, selectedArtifactTaskId, setSelectedArtifactTaskId } = useJuly();
+  const { activeNode, activeUrl, tasks, selectedArtifactTaskId, setSelectedArtifactTaskId } =
+    useJuly();
   const tasksWithArtifacts = useMemo(
     () => tasks.filter((t) => t.artifacts_count > 0),
     [tasks]
@@ -57,7 +58,7 @@ export default function ArtifactsScreen() {
     }
     let cancelled = false;
     setErr(null);
-    fetchTaskMeta(activeNode.url, activeNode.token, chosenTaskId)
+    fetchTaskMeta(activeUrl, activeNode.token, chosenTaskId)
       .then((m) => {
         if (cancelled) return;
         setMeta(m);
@@ -74,7 +75,7 @@ export default function ArtifactsScreen() {
     return () => {
       cancelled = true;
     };
-  }, [chosenTaskId, activeNode.url, activeNode.token]);
+  }, [chosenTaskId, activeUrl, activeNode.token]);
 
   useEffect(() => {
     if (!chosenTaskId || !selectedFile || selectedFile.endsWith('.png')) {
@@ -82,7 +83,7 @@ export default function ArtifactsScreen() {
       return;
     }
     let cancelled = false;
-    fetchTextArtifact(activeNode.url, activeNode.token, chosenTaskId, selectedFile)
+    fetchTextArtifact(activeUrl, activeNode.token, chosenTaskId, selectedFile)
       .then((txt) => {
         if (!cancelled) setTextContent(txt);
       })
@@ -92,7 +93,7 @@ export default function ArtifactsScreen() {
     return () => {
       cancelled = true;
     };
-  }, [chosenTaskId, selectedFile, activeNode.url, activeNode.token]);
+  }, [chosenTaskId, selectedFile, activeUrl, activeNode.token]);
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -152,7 +153,7 @@ export default function ArtifactsScreen() {
                   <View style={styles.imgWrap}>
                     <Image
                       source={{
-                        uri: getArtifactUrl(activeNode.url, chosenTaskId, selectedFile),
+                        uri: getArtifactUrl(activeUrl, chosenTaskId, selectedFile),
                         headers: activeNode.token ? { 'X-July-Token': activeNode.token } : undefined,
                       }}
                       style={styles.osImage}

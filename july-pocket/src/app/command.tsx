@@ -31,6 +31,7 @@ export default function CommandScreen() {
   const router = useRouter();
   const {
     activeNode,
+    activeUrl,
     healthById,
     tasks,
     setSelectedTaskId,
@@ -74,7 +75,7 @@ export default function CommandScreen() {
 
   const pollSessions = useCallback(async () => {
     try {
-      const sessResp = await fetchTmuxSessions(activeNode.url, activeNode.token);
+      const sessResp = await fetchTmuxSessions(activeUrl, activeNode.token);
       setTmuxAvailable(sessResp.available);
       setTmuxSessions((prev) =>
         JSON.stringify(prev) === JSON.stringify(sessResp.sessions) ? prev : sessResp.sessions
@@ -83,7 +84,7 @@ export default function CommandScreen() {
     } catch (e) {
       setTmuxErr(e instanceof Error ? e.message : 'Tmux unreachable');
     }
-  }, [activeNode.url, activeNode.token]);
+  }, [activeUrl, activeNode.token]);
 
   useEffect(() => {
     if (mode !== 'tmux') return;
@@ -128,7 +129,7 @@ export default function CommandScreen() {
   const handleKillSession = async () => {
     setTmuxErr(null);
     try {
-      await sendTmuxKey(activeNode.url, activeNode.token, tmuxSession, 'kill-session');
+      await sendTmuxKey(activeUrl, activeNode.token, tmuxSession, 'kill-session');
       await pollSessions();
     } catch (e) {
       setTmuxErr(e instanceof Error ? e.message : 'Kill failed');
@@ -142,7 +143,7 @@ export default function CommandScreen() {
     setNewSessionName('');
     setTmuxSession(clean);
     try {
-      await execTmuxCommand(activeNode.url, activeNode.token, clean, '');
+      await execTmuxCommand(activeUrl, activeNode.token, clean, '');
       await pollSessions();
     } catch {
       // handled cleanly by poll/WS
@@ -153,7 +154,7 @@ export default function CommandScreen() {
     setWaking(true);
     setErrMsg(null);
     try {
-      const tid = await wakeRemoteOllama(activeNode.url, activeNode.token);
+      const tid = await wakeRemoteOllama(activeUrl, activeNode.token);
       setWakeTaskId(tid);
       await refreshNow();
     } catch (e) {
@@ -166,7 +167,7 @@ export default function CommandScreen() {
     setSleeping(true);
     setErrMsg(null);
     try {
-      await unloadRemoteOllama(activeNode.url, activeNode.token);
+      await unloadRemoteOllama(activeUrl, activeNode.token);
       setWokenFallback(false);
       setWakeTaskId(null);
       await refreshNow();
@@ -181,7 +182,7 @@ export default function CommandScreen() {
     setSubmitting(true);
     setErrMsg(null);
     try {
-      const res = await dispatchApiRun(activeNode.url, activeNode.token, payload);
+      const res = await dispatchApiRun(activeUrl, activeNode.token, payload);
       setSelectedTaskId(res.task_id);
       await refreshNow();
       router.push('/queue');
@@ -313,7 +314,7 @@ export default function CommandScreen() {
             ) : null}
 
             <TmuxTerminal
-              baseUrl={activeNode.url}
+              baseUrl={activeUrl}
               token={activeNode.token}
               session={tmuxSession}
             />

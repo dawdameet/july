@@ -86,8 +86,10 @@ export default function MachinesScreen() {
     nodes,
     activeNodeId,
     activeNode,
+    activeUrl,
     setActiveNodeId,
     addOrUpdateNode,
+    unlockNode,
     removeNode,
     healthById,
     refreshNow,
@@ -96,7 +98,9 @@ export default function MachinesScreen() {
   const [showAdd, setShowAdd] = useState(false);
   const [nameInput, setNameInput] = useState('');
   const [urlInput, setUrlInput] = useState('http://192.168.1.');
+  const [tailscaleInput, setTailscaleInput] = useState('');
   const [tokenInput, setTokenInput] = useState('');
+  const [unlockInput, setUnlockInput] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
 
@@ -116,22 +120,39 @@ export default function MachinesScreen() {
       id: cleanId,
       name: cleanName,
       url: urlInput.trim(),
+      tailscaleUrl: tailscaleInput.trim() || undefined,
       token: tokenInput.trim(),
     });
     setNameInput('');
     setUrlInput('http://192.168.1.');
+    setTailscaleInput('');
     setTokenInput('');
     setShowAdd(false);
+  };
+
+  const handleEditSelected = () => {
+    setNameInput(activeNode.name);
+    setUrlInput(activeNode.url);
+    setTailscaleInput(activeNode.tailscaleUrl ?? '');
+    setTokenInput(activeNode.token);
+    setShowAdd(true);
+  };
+
+  const handleUnlock = async () => {
+    if (!unlockInput.trim()) return;
+    unlockNode(activeNode.id, unlockInput);
+    setUnlockInput('');
+    await refreshNow();
   };
 
   const handleToggleOllama = async () => {
     try {
       const awake = Boolean(stats?.ollama_up && stats?.ollama_loaded);
       if (awake) {
-        const tid = await unloadRemoteOllama(activeNode.url, activeNode.token);
+        const tid = await unloadRemoteOllama(activeUrl, activeNode.token);
         setActionMsg(`Sleep requested (${tid})`);
       } else {
-        const tid = await wakeRemoteOllama(activeNode.url, activeNode.token);
+        const tid = await wakeRemoteOllama(activeUrl, activeNode.token);
         setActionMsg(`Spin-up requested (${tid})`);
       }
       await refreshNow();
@@ -179,17 +200,26 @@ export default function MachinesScreen() {
                   {h?.online && h.rttMs !== null ? (
                     <Text style={styles.rttText}>{h.rttMs} ms</Text>
                   ) : (
-                    <Text style={styles.rttOffline}>offline</Text>
+                    <Text style={styles.rttOffline}>
+                      {h?.authRequired ? 'locked' : 'offline'}
+                    </Text>
                   )}
                 </View>
                 <View style={styles.nodeChipBottom}>
                   <Text numberOfLines={1} style={styles.nodeUrl}>
-                    {node.url.replace(/^https?:\/\//, '')}
+                    {(h?.resolvedUrl ?? node.url).replace(/^https?:\/\//, '')}
                   </Text>
-                  {nodes.length > 1 && selected && (
-                    <Pressable onPress={() => removeNode(node.id)}>
-                      <Text style={styles.removeText}>remove</Text>
-                    </Pressable>
+                  {selected && (
+                    <View style={styles.chipActions}>
+                      <Pressable onPress={handleEditSelected}>
+                        <Text style={styles.removeText}>edit</Text>
+                      </Pressable>
+                      {nodes.length > 1 && (
+                        <Pressable onPress={() => removeNode(node.id)}>
+                          <Text style={styles.removeText}>remove</Text>
+                        </Pressable>
+                      )}
+                    </View>
                   )}
                 </View>
               </Pressable>
@@ -200,7 +230,7 @@ export default function MachinesScreen() {
             style={[styles.addBtn, showAdd && styles.addBtnActive]}
             onPress={() => setShowAdd((v) => !v)}>
             <Text style={[styles.addBtnText, showAdd && styles.addBtnTextActive]}>
-              {showAdd ? 'Cancel' : '+ Add Node'}
+              {showAdd ? 'Cancel' : '+ Add / Edit Node'}
             </Text>
           </Pressable>
         </View>
@@ -218,7 +248,16 @@ export default function MachinesScreen() {
             <TextInput
               value={urlInput}
               onChangeText={setUrlInput}
-              placeholder="http://192.168.1.41:8080"
+              placeholder="Primary URL (e.g. http://192.168.1.41:8080)"
+              placeholderTextColor={Palette.dim}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.input}
+            />
+            <TextInput
+              value={tailscaleInput}
+              onChangeText={setTailscaleInput}
+              placeholder="Tailscale URL (e.g. http://100.x.y.z:8080, auto-detected)"
               placeholderTextColor={Palette.dim}
               autoCapitalize="none"
               autoCorrect={false}
@@ -227,7 +266,7 @@ export default function MachinesScreen() {
             <TextInput
               value={tokenInput}
               onChangeText={setTokenInput}
-              placeholder="X-July-Token (optional)"
+              placeholder="Password / X-July-Token (optional)"
               placeholderTextColor={Palette.dim}
               autoCapitalize="none"
               autoCorrect={false}
@@ -321,6 +360,15 @@ export default function MachinesScreen() {
                 />
                 <InfoRow label="Uptime" value={formatUptime(stats.uptime_sec)} />
                 <InfoRow
+                  label="Tailscale"
+                  value={stats.tailscale_ip ? stats.tailscale_ip : 'not connected'}
+                  highlight={Boolean(stats.tailscale_ip)}
+                />
+                <InfoRow
+                  label="Auth"
+                  value={stats.auth_required ? 'token protected' : 'open (no token)'}
+                />
+                <InfoRow
                   label="Queue Capacity"
                   value={`${stats.queue_depth} / ${stats.max_queue}`}
                   last
@@ -355,14 +403,37 @@ export default function MachinesScreen() {
               {actionMsg && <Text style={styles.actionMsg}>{actionMsg}</Text>}
             </View>
           </>
+        ) : activeHealth?.authRequired ? (
+          <View style={styles.card}>
+            <Text style={styles.offlineTitle}>NODE LOCKED · TOKEN REQUIRED</Text>
+            <Text style={styles.offlineDetail}>{activeUrl} responded HTTP 401</Text>
+            <Text style={styles.mutedText}>
+              Enter the node&apos;s pairing token (`~/.july/token` or `--token`). Saved encrypted in
+              iOS Keychain.
+            </Text>
+            <TextInput
+              value={unlockInput}
+              onChangeText={setUnlockInput}
+              placeholder="Enter node token"
+              placeholderTextColor={Palette.dim}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+              style={styles.input}
+            />
+            <Pressable style={styles.primaryBtn} onPress={handleUnlock}>
+              <Text style={styles.primaryBtnText}>Unlock & Save</Text>
+            </Pressable>
+          </View>
         ) : (
           <View style={styles.card}>
             <Text style={styles.offlineTitle}>NODE UNREACHABLE</Text>
             <Text style={styles.offlineDetail}>
-              {activeNode.url} ({activeHealth?.error ?? 'connecting...'})
+              {activeUrl} ({activeHealth?.error ?? 'connecting...'})
             </Text>
             <Text style={styles.mutedText}>
-              Ensure `./server 8080` is running on the target host and reachable over your LAN.
+              Ensure `./server 8080` is running on the target host and reachable over LAN or
+              Tailscale.
             </Text>
           </View>
         )}
@@ -457,6 +528,11 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.mono,
     fontSize: 11,
     flexShrink: 1,
+  },
+  chipActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
   removeText: {
     color: Palette.muted,

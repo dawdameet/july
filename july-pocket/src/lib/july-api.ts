@@ -16,6 +16,8 @@ export interface NodeStats {
   uptime_sec: number;
   ollama_up: boolean;
   ollama_loaded?: boolean;
+  tailscale_ip?: string;
+  auth_required?: boolean;
   workspaces: string[];
 }
 
@@ -89,11 +91,29 @@ function makeHeaders(token?: string, jsonBody?: boolean): Record<string, string>
   return h;
 }
 
+export class HttpStatusError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export function normalizeBaseUrl(raw: string): string {
   const trimmed = raw.trim().replace(/\/+$/, '');
   if (!trimmed) return 'http://192.168.1.41:8080';
   if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
   return `http://${trimmed}`;
+}
+
+export function buildTailscaleUrl(primaryUrl: string, tailscaleIp: string): string {
+  try {
+    const u = new URL(normalizeBaseUrl(primaryUrl));
+    const portPart = u.port ? `:${u.port}` : '';
+    return `${u.protocol}//${tailscaleIp}${portPart}`;
+  } catch {
+    return `http://${tailscaleIp}:8080`;
+  }
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 4000): Promise<Response> {
@@ -108,17 +128,23 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
 
 export async function fetchNodeStats(
   baseUrl: string,
-  token?: string
+  token?: string,
+  timeoutMs = 2800
 ): Promise<{ stats: NodeStats; rttMs: number }> {
   const t0 = Date.now();
-  const res = await fetchWithTimeout(`${normalizeBaseUrl(baseUrl)}/stats`, {
-    headers: makeHeaders(token),
-  });
+  const res = await fetchWithTimeout(
+    `${normalizeBaseUrl(baseUrl)}/stats`,
+    { headers: makeHeaders(token) },
+    timeoutMs
+  );
+  if (res.status === 401) {
+    throw new HttpStatusError(401, 'Unauthorized: Invalid Token');
+  }
   if (res.status === 404) {
-    throw new Error('HTTP 404 (/stats missing — restart Fedora with new server binary)');
+    throw new HttpStatusError(404, 'HTTP 404 (/stats missing — restart server on node)');
   }
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new HttpStatusError(res.status, `HTTP ${res.status}`);
   }
   const stats = (await res.json()) as NodeStats;
   return { stats, rttMs: Math.max(1, Date.now() - t0) };

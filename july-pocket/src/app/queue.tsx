@@ -18,6 +18,7 @@ export default function QueueScreen() {
   const router = useRouter();
   const {
     activeNode,
+    activeUrl,
     tasks,
     selectedTaskId,
     setSelectedTaskId,
@@ -59,7 +60,7 @@ export default function QueueScreen() {
       inFlight = true;
       try {
         const chunk = await fetchStreamChunk(
-          activeNode.url,
+          activeUrl,
           activeNode.token,
           viewingId,
           offsetRef.current
@@ -93,7 +94,7 @@ export default function QueueScreen() {
       cancelled = true;
       if (iv) clearInterval(iv);
     };
-  }, [viewingId, activeNode.url, activeNode.token]);
+  }, [viewingId, activeUrl, activeNode.token]);
 
   const turnEvents = useMemo(() => {
     return streamLog
@@ -104,7 +105,7 @@ export default function QueueScreen() {
 
   const handleKill = async (tid: string) => {
     try {
-      await killRemoteTask(activeNode.url, activeNode.token, tid);
+      await killRemoteTask(activeUrl, activeNode.token, tid);
       await refreshNow();
     } catch {
       // ignore

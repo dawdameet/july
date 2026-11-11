@@ -45,6 +45,42 @@
 #include "workflow.h"
 
 static char g_auth_token[256] = {0};
+static char g_bind_ip[64] = {0};
+
+static bool is_tailscale_ipv4(uint32_t net_addr)
+{
+    uint32_t host_addr = ntohl(net_addr);
+    return (host_addr & 0xFFC00000U) == 0x64400000U; // 100.64.0.0/10 CGNAT/Tailscale
+}
+
+static bool find_tailscale_ip(char *out, size_t max_out)
+{
+    if (!out || max_out == 0) return false;
+    out[0] = '\0';
+    struct ifaddrs *ifaddr = NULL, *ifa = NULL;
+    if (getifaddrs(&ifaddr) != 0) return false;
+
+    bool found = false;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        if (!is_tailscale_ipv4(sa->sin_addr.s_addr)) continue;
+        char tmp[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) continue;
+
+        bool is_ts_if = (strncmp(ifa->ifa_name, "tailscale", 9) == 0 ||
+                         strncmp(ifa->ifa_name, "utun", 4) == 0);
+        if (!found || is_ts_if)
+        {
+            safe_copy_str(out, max_out, tmp);
+            found = true;
+            if (strncmp(ifa->ifa_name, "tailscale", 9) == 0) break;
+        }
+    }
+    freeifaddrs(ifaddr);
+    return found;
+}
 
 static inline bool is_request_authenticated(const char *headers, size_t header_len)
 {
@@ -1689,6 +1725,8 @@ static void build_stats_json(char *out, size_t max_len)
     bool ollama_up = false;
     bool ollama_loaded = false;
     probe_ollama_status(&ollama_up, &ollama_loaded);
+    char ts_ip[64] = {0};
+    find_tailscale_ip(ts_ip, sizeof(ts_ip));
     long uptime_sec = (long)(time(NULL) - g_server_start_time);
 
     size_t pos = 0;
@@ -1698,13 +1736,15 @@ static void build_stats_json(char *out, size_t max_len)
         "\"ram_total_mb\":%llu,\"ram_used_mb\":%llu,\"ram_available_mb\":%llu,"
         "\"tmpfs_total_mb\":%llu,\"tmpfs_used_mb\":%llu,"
         "\"queue_depth\":%d,\"max_queue\":%d,\"active_tasks\":%d,"
-        "\"uptime_sec\":%ld,\"ollama_up\":%s,\"ollama_loaded\":%s,\"workspaces\":[",
+        "\"uptime_sec\":%ld,\"ollama_up\":%s,\"ollama_loaded\":%s,"
+        "\"tailscale_ip\":\"%s\",\"auth_required\":%s,\"workspaces\":[",
         hostname, os_name, arch_name, cores,
         load1, load5,
         ram_total_mb, ram_used_mb, ram_avail_mb,
         tmpfs_total_mb, tmpfs_used_mb,
         q_depth, MAX_QUEUE, active_cnt,
-        uptime_sec, ollama_up ? "true" : "false", ollama_loaded ? "true" : "false");
+        uptime_sec, ollama_up ? "true" : "false", ollama_loaded ? "true" : "false",
+        ts_ip, (g_auth_token[0] != '\0') ? "true" : "false");
 
     DIR *wd = opendir("/tmp/july_workspaces");
     if (wd)
@@ -3555,7 +3595,8 @@ static void print_server_network_banner(int port, const char *backend)
 {
     printf("\n┌─────────────────────────────────────────────────────────────┐\n");
     printf("│  July Task & Workflow Engine (%-6s backend)            │\n", backend);
-    printf("│  Listening on: 0.0.0.0:%-5d (All LAN interfaces)          │\n", port);
+    printf("│  Listening on: %-15s:%-5d                        │\n",
+           g_bind_ip[0] ? g_bind_ip : "0.0.0.0", port);
     printf("│  Worker Pool:  %d threads                                   │\n", NUM_WORKERS);
     if (g_auth_token[0] != '\0')
     {
@@ -3566,7 +3607,7 @@ static void print_server_network_banner(int port, const char *backend)
         printf("│  Auth Mode:    Open LAN (No token configured)               │\n");
     }
     printf("├─────────────────────────────────────────────────────────────┤\n");
-    printf("│  Connect with dispatcher from your Mac / LAN:               │\n");
+    printf("│  Connect with dispatcher / July Pocket:                     │\n");
 
     struct ifaddrs *ifaddr, *ifa;
     int found_lan = 0;
@@ -3581,9 +3622,17 @@ static void print_server_network_banner(int port, const char *backend)
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &(sa->sin_addr), ip_str, sizeof(ip_str));
 
+            if (g_bind_ip[0] && strcmp(ip_str, g_bind_ip) != 0)
+                continue;
+
             if (strcmp(ip_str, "127.0.0.1") == 0)
             {
                 printf("│    • Local loopback:  http://%s:%-5d                  │\n", ip_str, port);
+            }
+            else if (is_tailscale_ipv4(sa->sin_addr.s_addr))
+            {
+                printf("│    • Tailscale (%-6s): http://%-15s:%-5d      │\n", ifa->ifa_name, ip_str, port);
+                found_lan = 1;
             }
             else
             {
@@ -3620,17 +3669,40 @@ int main(int argc, char **argv)
     const char *env_tok = getenv("JULY_TOKEN");
     if (env_tok) safe_copy_str(g_auth_token, sizeof(g_auth_token), env_tok);
 
+    bool tailscale_only = false;
+    bool gen_token = false;
     for (int i = 1; i < argc; i++)
     {
         if ((strcmp(argv[i], "--token") == 0 || strcmp(argv[i], "-k") == 0) && i + 1 < argc)
         {
             safe_copy_str(g_auth_token, sizeof(g_auth_token), argv[++i]);
         }
+        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
+        {
+            safe_copy_str(g_bind_ip, sizeof(g_bind_ip), argv[++i]);
+        }
+        else if (strcmp(argv[i], "--tailscale-only") == 0)
+        {
+            tailscale_only = true;
+        }
+        else if (strcmp(argv[i], "--gen-token") == 0)
+        {
+            gen_token = true;
+        }
         else if (argv[i][0] != '-')
         {
             int p = atoi(argv[i]);
             if (p > 0 && p <= 65535)
                 port = p;
+        }
+    }
+
+    if (tailscale_only && g_bind_ip[0] == '\0')
+    {
+        if (!find_tailscale_ip(g_bind_ip, sizeof(g_bind_ip)))
+        {
+            fprintf(stderr, "[Error] --tailscale-only requested, but no 100.64.0.0/10 Tailscale IPv4 found.\n");
+            return EXIT_FAILURE;
         }
     }
 
@@ -3652,6 +3724,32 @@ int main(int argc, char **argv)
                 }
                 fclose(tf);
             }
+            if (g_auth_token[0] == '\0' && gen_token)
+            {
+                uint8_t rbytes[16] = {0};
+                int ufd = open("/dev/urandom", O_RDONLY);
+                if (ufd >= 0)
+                {
+                    ssize_t got = read(ufd, rbytes, sizeof(rbytes));
+                    close(ufd);
+                    if (got == (ssize_t)sizeof(rbytes))
+                    {
+                        for (size_t k = 0; k < sizeof(rbytes); k++)
+                            snprintf(g_auth_token + k * 2, 3, "%02x", rbytes[k]);
+                        char dir_path[512];
+                        snprintf(dir_path, sizeof(dir_path), "%s/.july", home);
+                        mkdir_p(dir_path);
+                        int out_fd = open(token_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                        if (out_fd >= 0)
+                        {
+                            write(out_fd, g_auth_token, strlen(g_auth_token));
+                            write(out_fd, "\n", 1);
+                            close(out_fd);
+                        }
+                        printf("[Auth] Generated & saved token to %s:\n       %s\n", token_file, g_auth_token);
+                    }
+                }
+            }
         }
     }
 
@@ -3670,7 +3768,19 @@ int main(int argc, char **argv)
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in address = {0};
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (g_bind_ip[0] != '\0')
+    {
+        if (inet_pton(AF_INET, g_bind_ip, &address.sin_addr) != 1)
+        {
+            fprintf(stderr, "[Error] Invalid bind IP: %s\n", g_bind_ip);
+            close(server_fd);
+            return EXIT_FAILURE;
+        }
+    }
+    else
+    {
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
     address.sin_port = htons(port);
     address.sin_family = AF_INET;
 

@@ -1,22 +1,31 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import * as SecureStore from 'expo-secure-store';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
 
 import {
+  buildTailscaleUrl,
   fetchNodeStats,
   fetchNodeTasks,
+  HttpStatusError,
   NodeStats,
   normalizeBaseUrl,
   TaskItem,
 } from '@/lib/july-api';
 
+const STORAGE_KEY = 'july_pocket_state_v1';
+
 export interface NodeConfig {
   id: string;
   name: string;
   url: string;
+  tailscaleUrl?: string;
   token: string;
 }
 
 export interface NodeHealth {
   online: boolean;
+  authRequired: boolean;
+  resolvedUrl: string;
   rttMs: number | null;
   error: string | null;
   stats: NodeStats | null;
@@ -27,8 +36,10 @@ interface JulyContextValue {
   nodes: NodeConfig[];
   activeNodeId: string;
   activeNode: NodeConfig;
+  activeUrl: string;
   setActiveNodeId: (id: string) => void;
   addOrUpdateNode: (node: NodeConfig) => void;
+  unlockNode: (id: string, token: string) => void;
   removeNode: (id: string) => void;
   healthById: Record<string, NodeHealth>;
   tasks: TaskItem[];
@@ -50,6 +61,46 @@ const DEFAULT_NODES: NodeConfig[] = [
   },
 ];
 
+async function loadPersistedState(): Promise<{
+  nodes?: NodeConfig[];
+  activeNodeId?: string;
+  commandHistory?: string[];
+} | null> {
+  try {
+    let raw: string | null = null;
+    if (Platform.OS === 'web') {
+      raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
+    } else {
+      raw = await SecureStore.getItemAsync(STORAGE_KEY);
+    }
+    if (!raw) return null;
+    return JSON.parse(raw) as {
+      nodes?: NodeConfig[];
+      activeNodeId?: string;
+      commandHistory?: string[];
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function savePersistedState(payload: {
+  nodes: NodeConfig[];
+  activeNodeId: string;
+  commandHistory: string[];
+}) {
+  try {
+    const raw = JSON.stringify(payload);
+    if (Platform.OS === 'web') {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, raw);
+    } else {
+      await SecureStore.setItemAsync(STORAGE_KEY, raw);
+    }
+  } catch {
+    // ignore keychain write errors in restricted simulators
+  }
+}
+
 const JulyContext = createContext<JulyContextValue | null>(null);
 
 export function JulyProvider({ children }: { children: React.ReactNode }) {
@@ -64,67 +115,156 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
     'make test-sync',
     'git status -s',
   ]);
+  const [hydrated, setHydrated] = useState(false);
 
   const activeNode = nodes.find((n) => n.id === activeNodeId) ?? nodes[0];
+  const activeHealth = healthById[activeNode.id];
+  const activeUrl = activeHealth?.resolvedUrl ?? activeNode.url;
+  const activeUrlRef = useRef(activeUrl);
+  activeUrlRef.current = activeUrl;
 
-  const pollAll = useCallback(async () => {
-    const results = await Promise.all(
-      nodes.map(async (node) => {
+  useEffect(() => {
+    void loadPersistedState().then((saved) => {
+      if (saved?.nodes && saved.nodes.length > 0) {
+        setNodes(saved.nodes);
+        if (saved.activeNodeId && saved.nodes.some((n) => n.id === saved.activeNodeId)) {
+          setActiveNodeId(saved.activeNodeId);
+        } else {
+          setActiveNodeId(saved.nodes[0].id);
+        }
+      }
+      if (saved?.commandHistory && saved.commandHistory.length > 0) {
+        setCommandHistory(saved.commandHistory);
+      }
+      setHydrated(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    void savePersistedState({ nodes, activeNodeId, commandHistory });
+  }, [hydrated, nodes, activeNodeId, commandHistory]);
+
+  const probeNode = useCallback(
+    async (
+      node: NodeConfig
+    ): Promise<{ id: string; health: NodeHealth; discoveredTailscale?: string }> => {
+      const candidates = [node.url];
+      if (node.tailscaleUrl && normalizeBaseUrl(node.tailscaleUrl) !== normalizeBaseUrl(node.url)) {
+        candidates.push(normalizeBaseUrl(node.tailscaleUrl));
+      }
+
+      let lastErr: unknown = null;
+      let lastCandidate = node.url;
+
+      for (const candidate of candidates) {
+        lastCandidate = candidate;
         try {
-          const { stats, rttMs } = await fetchNodeStats(node.url, node.token);
-          return [
-            node.id,
-            {
+          const { stats, rttMs } = await fetchNodeStats(candidate, node.token);
+          const discoveredTailscale = stats.tailscale_ip
+            ? buildTailscaleUrl(node.url, stats.tailscale_ip)
+            : undefined;
+          return {
+            id: node.id,
+            discoveredTailscale,
+            health: {
               online: true,
+              authRequired: false,
+              resolvedUrl: candidate,
               rttMs,
               error: null,
               stats,
               lastUpdated: Date.now(),
-            } satisfies NodeHealth,
-          ] as const;
+            },
+          };
         } catch (err) {
-          return [
-            node.id,
-            {
-              online: false,
-              rttMs: null,
-              error: err instanceof Error ? err.message : 'Unreachable',
-              stats: null,
-              lastUpdated: Date.now(),
-            } satisfies NodeHealth,
-          ] as const;
+          lastErr = err;
+          if (err instanceof HttpStatusError && err.status === 401) {
+            return {
+              id: node.id,
+              health: {
+                online: false,
+                authRequired: true,
+                resolvedUrl: candidate,
+                rttMs: null,
+                error: err.message,
+                stats: null,
+                lastUpdated: Date.now(),
+              },
+            };
+          }
         }
-      })
-    );
+      }
+
+      return {
+        id: node.id,
+        health: {
+          online: false,
+          authRequired: false,
+          resolvedUrl: lastCandidate,
+          rttMs: null,
+          error: lastErr instanceof Error ? lastErr.message : 'Unreachable',
+          stats: null,
+          lastUpdated: Date.now(),
+        },
+      };
+    },
+    []
+  );
+
+  const pollAll = useCallback(async () => {
+    const results = await Promise.all(nodes.map((node) => probeNode(node)));
 
     setHealthById((prev) => {
       const next = { ...prev };
-      for (const [id, health] of results) {
-        next[id] = health;
+      for (const r of results) {
+        next[r.id] = r.health;
       }
       return next;
     });
 
+    setNodes((prev) => {
+      let changed = false;
+      const next = prev.map((n) => {
+        const hit = results.find((r) => r.id === n.id);
+        if (
+          hit?.discoveredTailscale &&
+          hit.discoveredTailscale !== n.tailscaleUrl &&
+          normalizeBaseUrl(hit.discoveredTailscale) !== normalizeBaseUrl(n.url)
+        ) {
+          changed = true;
+          return { ...n, tailscaleUrl: hit.discoveredTailscale };
+        }
+        return n;
+      });
+      return changed ? next : prev;
+    });
+
+    const activeRes = results.find((r) => r.id === activeNode.id);
+    const targetUrl = activeRes?.health.resolvedUrl ?? activeUrlRef.current;
+
     try {
-      const list = await fetchNodeTasks(activeNode.url, activeNode.token);
+      const list = await fetchNodeTasks(targetUrl, activeNode.token);
       setTasks((prev) => (JSON.stringify(prev) === JSON.stringify(list) ? prev : list));
     } catch {
-      // Keep last known tasks when momentarily offline
+      // Keep last known tasks when momentarily offline or locked
     }
-  }, [nodes, activeNode.url, activeNode.token]);
+  }, [nodes, activeNode.id, activeNode.token, probeNode]);
 
   useEffect(() => {
+    if (!hydrated) return;
     void pollAll();
     const timer = setInterval(() => {
       void pollAll();
     }, 2000);
     return () => clearInterval(timer);
-  }, [pollAll]);
+  }, [hydrated, pollAll]);
 
   const addOrUpdateNode = useCallback((node: NodeConfig) => {
     const normalized: NodeConfig = {
       ...node,
       url: normalizeBaseUrl(node.url),
+      tailscaleUrl: node.tailscaleUrl?.trim() ? normalizeBaseUrl(node.tailscaleUrl) : undefined,
     };
     setNodes((prev) => {
       const exists = prev.some((n) => n.id === normalized.id);
@@ -133,6 +273,10 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
         : [...prev, normalized];
     });
     setActiveNodeId(normalized.id);
+  }, []);
+
+  const unlockNode = useCallback((id: string, token: string) => {
+    setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, token: token.trim() } : n)));
   }, []);
 
   const removeNode = useCallback((id: string) => {
@@ -156,8 +300,10 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
         nodes,
         activeNodeId,
         activeNode,
+        activeUrl,
         setActiveNodeId,
         addOrUpdateNode,
+        unlockNode,
         removeNode,
         healthById,
         tasks,
@@ -179,4 +325,3 @@ export function useJuly(): JulyContextValue {
   if (!ctx) throw new Error('useJuly must be used inside JulyProvider');
   return ctx;
 }
-
