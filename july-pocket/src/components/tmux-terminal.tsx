@@ -54,6 +54,7 @@ export function TmuxTerminal({ baseUrl, token, session }: TmuxTerminalProps) {
   const [ctrlArmed, setCtrlArmed] = useState(false);
   const [showHelpers, setShowHelpers] = useState(false);
   const [fontSize, setFontSize] = useState(11.5);
+  const [colorEnabled, setColorEnabled] = useState(true);
   const [nonce, setNonce] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
 
@@ -113,15 +114,31 @@ html, body {
     }
   };
 
-  var term = new window.Terminal({
-    fontFamily: 'ui-monospace, Menlo, Monaco, "SF Mono", monospace',
-    fontSize: 11.5,
-    lineHeight: 1.2,
-    cursorBlink: true,
-    cursorStyle: 'block',
-    scrollback: 2500,
-    allowProposedApi: true,
-    theme: {
+  var THEMES = {
+    color: {
+      background: '#000000',
+      foreground: '#FAFAFA',
+      cursor: '#FAFAFA',
+      cursorAccent: '#000000',
+      selectionBackground: 'rgba(255,255,255,0.28)',
+      black: '#18181B',
+      brightBlack: '#71717A',
+      red: '#F87171',
+      brightRed: '#FCA5A5',
+      green: '#4ADE80',
+      brightGreen: '#86EFAC',
+      yellow: '#FACC15',
+      brightYellow: '#FDE047',
+      blue: '#60A5FA',
+      brightBlue: '#93C5FD',
+      magenta: '#C084FC',
+      brightMagenta: '#D8B4FE',
+      cyan: '#22D3EE',
+      brightCyan: '#67E8F9',
+      white: '#E4E4E7',
+      brightWhite: '#FAFAFA'
+    },
+    mono: {
       background: '#000000',
       foreground: '#FAFAFA',
       cursor: '#FAFAFA',
@@ -144,6 +161,17 @@ html, body {
       white: '#D4D4D8',
       brightWhite: '#FAFAFA'
     }
+  };
+
+  var term = new window.Terminal({
+    fontFamily: 'ui-monospace, Menlo, Monaco, "SF Mono", monospace',
+    fontSize: 11.5,
+    lineHeight: 1.2,
+    cursorBlink: true,
+    cursorStyle: 'block',
+    scrollback: 2500,
+    allowProposedApi: true,
+    theme: THEMES.color
   });
 
   var fitAddon = new window.FitAddon.FitAddon();
@@ -233,6 +261,9 @@ html, body {
     term.options.fontSize = sz;
     safeFit();
   };
+  window.__julySetTheme = function(useColor) {
+    term.options.theme = useColor ? THEMES.color : THEMES.mono;
+  };
 })();
 </script>
 </body>
@@ -248,6 +279,12 @@ html, body {
     const clamped = Math.max(7, Math.min(18, Math.round(nextSize * 2) / 2));
     setFontSize(clamped);
     webRef.current?.injectJavaScript(`window.__julySetFont && window.__julySetFont(${clamped}); true;`);
+  };
+
+  const toggleColorMode = () => {
+    const next = !colorEnabled;
+    setColorEnabled(next);
+    webRef.current?.injectJavaScript(`window.__julySetTheme && window.__julySetTheme(${next}); true;`);
   };
 
   const toggleCtrl = () => {
@@ -325,17 +362,26 @@ html, body {
         <View style={styles.keyRow}>
           <Pressable onPress={() => applyFontSize(fontSize - 1)} style={styles.keyBtn}>
             <Text numberOfLines={1} style={styles.keyBtnText}>
-              A- (MORE COLS)
+              A-
             </Text>
           </Pressable>
           <Pressable onPress={() => applyFontSize(11.5)} style={styles.keyBtn}>
             <Text numberOfLines={1} style={styles.keyBtnText}>
-              {fontSize}px{dims ? ` · ${dims}` : ''}
+              {fontSize}px
             </Text>
           </Pressable>
           <Pressable onPress={() => applyFontSize(fontSize + 1)} style={styles.keyBtn}>
             <Text numberOfLines={1} style={styles.keyBtnText}>
               A+
+            </Text>
+          </Pressable>
+          <Pressable
+            onPress={toggleColorMode}
+            style={[styles.keyBtn, colorEnabled && styles.keyBtnActive]}>
+            <Text
+              numberOfLines={1}
+              style={[styles.keyBtnText, colorEnabled && styles.keyBtnTextActive]}>
+              {colorEnabled ? 'COLOR' : 'MONO'}
             </Text>
           </Pressable>
         </View>
@@ -351,7 +397,9 @@ html, body {
       source={{ html }}
       onMessage={handleMessage}
       onLoadEnd={() =>
-        webRef.current?.injectJavaScript(`window.__julySetFont && window.__julySetFont(${fontSize}); true;`)
+        webRef.current?.injectJavaScript(
+          `window.__julySetFont && window.__julySetFont(${fontSize}); window.__julySetTheme && window.__julySetTheme(${colorEnabled}); true;`
+        )
       }
       javaScriptEnabled
       domStorageEnabled
