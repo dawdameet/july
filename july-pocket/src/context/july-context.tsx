@@ -32,6 +32,12 @@ export interface NodeHealth {
   lastUpdated: number;
 }
 
+export interface TelemetrySample {
+  cpuPct: number;
+  ramPct: number;
+  rttMs: number;
+}
+
 interface JulyContextValue {
   nodes: NodeConfig[];
   activeNodeId: string;
@@ -42,6 +48,7 @@ interface JulyContextValue {
   unlockNode: (id: string, token: string) => void;
   removeNode: (id: string) => void;
   healthById: Record<string, NodeHealth>;
+  historyById: Record<string, TelemetrySample[]>;
   tasks: TaskItem[];
   selectedTaskId: string | null;
   setSelectedTaskId: (id: string | null) => void;
@@ -107,6 +114,7 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
   const [nodes, setNodes] = useState<NodeConfig[]>(DEFAULT_NODES);
   const [activeNodeId, setActiveNodeId] = useState<string>(DEFAULT_NODES[0].id);
   const [healthById, setHealthById] = useState<Record<string, NodeHealth>>({});
+  const [historyById, setHistoryById] = useState<Record<string, TelemetrySample[]>>({});
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedArtifactTaskId, setSelectedArtifactTaskId] = useState<string | null>(null);
@@ -223,6 +231,25 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
       return next;
     });
 
+    setHistoryById((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const r of results) {
+        if (!r.health.online || !r.health.stats) continue;
+        changed = true;
+        const st = r.health.stats;
+        const cpuPct =
+          typeof st.cpu_pct === 'number'
+            ? st.cpu_pct
+            : Math.min(100, (st.load_1m / Math.max(1, st.cores)) * 100);
+        const ramPct = st.ram_total_mb > 0 ? (st.ram_used_mb / st.ram_total_mb) * 100 : 0;
+        const rttMs = r.health.rttMs ?? 0;
+        const arr = prev[r.id] ?? [];
+        next[r.id] = [...arr.slice(-23), { cpuPct, ramPct, rttMs }];
+      }
+      return changed ? next : prev;
+    });
+
     setNodes((prev) => {
       let changed = false;
       const next = prev.map((n) => {
@@ -306,6 +333,7 @@ export function JulyProvider({ children }: { children: React.ReactNode }) {
         unlockNode,
         removeNode,
         healthById,
+        historyById,
         tasks,
         selectedTaskId,
         setSelectedTaskId,

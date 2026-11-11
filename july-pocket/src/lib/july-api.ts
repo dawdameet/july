@@ -5,11 +5,17 @@ export interface NodeStats {
   cores: number;
   load_1m: number;
   load_5m: number;
+  cpu_pct?: number;
+  cpu_temp_c?: number;
   ram_total_mb: number;
   ram_used_mb: number;
   ram_available_mb: number;
+  swap_total_mb?: number;
+  swap_used_mb?: number;
   tmpfs_total_mb: number;
   tmpfs_used_mb: number;
+  disk_total_mb?: number;
+  disk_used_mb?: number;
   queue_depth: number;
   max_queue: number;
   active_tasks: number;
