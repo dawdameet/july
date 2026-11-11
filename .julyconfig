@@ -3,15 +3,17 @@
   "target": "192.168.1.41:8080",
   "build": [
     "make clean",
-    "make"
+    "make -j4",
+    "mkdir -p dist && cp server dispatcher dist/"
   ],
   "artifacts": [
-    "server",
-    "dispatcher"
+    "dist/server",
+    "dist/dispatcher"
   ],
   "ignore": [
     ".git*",
     "*.o",
+    "*.bin",
     ".july*",
     "*.dSYM",
     ".DS_Store",
@@ -19,6 +21,7 @@
     "dispatcher",
     "dispatch",
     "picture",
-    "app"
+    "app",
+    "dist"
   ]
 }
