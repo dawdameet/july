@@ -356,7 +356,13 @@ static int run_command_in_sandbox(const char *command, const char *sandbox_dir,
         // 1. Process Group Isolation (so kill(-pgid) hits entire tree)
         setpgid(0, 0);
 
-        // 2. Redirect stdout & stderr
+        // 2. Redirect stdin (/dev/null), stdout & stderr
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
@@ -551,15 +557,15 @@ static int copy_file(const char *src, const char *dst)
     return 0;
 }
 
-/* Zero-copy kernel sendfile streaming */
-static void send_file_zero_copy(int sock_fd, int file_fd, size_t file_size)
+/* Zero-copy kernel sendfile streaming (from arbitrary byte offset) */
+static void send_file_slice_zero_copy(int sock_fd, int file_fd, off_t offset, size_t len)
 {
+    if (len == 0) return;
 #if defined(__APPLE__)
-    off_t len = (off_t)file_size;
-    sendfile(file_fd, sock_fd, 0, &len, NULL, 0);
+    off_t l = (off_t)len;
+    sendfile(file_fd, sock_fd, offset, &l, NULL, 0);
 #else
-    off_t offset = 0;
-    size_t remaining = file_size;
+    size_t remaining = len;
     while (remaining > 0)
     {
         ssize_t sent = sendfile(sock_fd, file_fd, &offset, remaining);
@@ -572,6 +578,12 @@ static void send_file_zero_copy(int sock_fd, int file_fd, size_t file_size)
         remaining -= (size_t)sent;
     }
 #endif
+}
+
+/* Zero-copy kernel sendfile streaming */
+static void send_file_zero_copy(int sock_fd, int file_fd, size_t file_size)
+{
+    send_file_slice_zero_copy(sock_fd, file_fd, 0, file_size);
 }
 
 /* ---------------- Workflow Pipeline Execution ---------------- */
@@ -1313,6 +1325,217 @@ static int prepare_response(Connection *conn, size_t request_len)
         if (strncmp(conn->input + 4, "/ ", 2) == 0)
         {
             write_response(conn, response_200, response_200_len);
+        }
+        else if (strncmp(conn->input + 4, "/stream/", 8) == 0)
+        {
+            // Live incremental byte-offset log stream: GET /stream/<taskId>?offset=<N>
+            const char *id_start = conn->input + 12;
+            const char *id_end = id_start;
+            while (*id_end && *id_end != ' ' && *id_end != '?' && *id_end != '\r' && *id_end != '\n')
+                id_end++;
+            size_t id_len = (size_t)(id_end - id_start);
+            char task_id[MAX_TASK_ID] = {0};
+            if (id_len >= sizeof(task_id)) id_len = sizeof(task_id) - 1;
+            memcpy(task_id, id_start, id_len);
+            task_id[id_len] = '\0';
+
+            size_t req_offset = 0;
+            if (*id_end == '?')
+            {
+                const char *q = id_end + 1;
+                const char *q_end = q;
+                while (*q_end && *q_end != ' ' && *q_end != '\r' && *q_end != '\n') q_end++;
+                const char *off_p = strstr(q, "offset=");
+                if (off_p && off_p < q_end)
+                {
+                    req_offset = (size_t)strtoull(off_p + 7, NULL, 10);
+                }
+            }
+
+            if (task_id[0] == '\0' || strstr(task_id, "..") || strchr(task_id, '/'))
+            {
+                write_response(conn, response_retrieve_bad_request, response_retrieve_bad_request_len);
+            }
+            else
+            {
+                char storage_log[512], storage_meta[512];
+                snprintf(storage_log, sizeof(storage_log), "/tmp/july_storage/%s/stdout.log", task_id);
+                snprintf(storage_meta, sizeof(storage_meta), "/tmp/july_storage/%s/meta.json", task_id);
+
+                struct stat meta_st;
+                bool completed = (stat(storage_meta, &meta_st) == 0);
+                int exit_code = 0;
+                int art_count = 0;
+                if (completed)
+                {
+                    FILE *mf = fopen(storage_meta, "r");
+                    if (mf)
+                    {
+                        char mline[256];
+                        while (fgets(mline, sizeof(mline), mf))
+                        {
+                            if (strstr(mline, "\"exit_code\":"))
+                                sscanf(strstr(mline, "\"exit_code\":") + 12, "%d", &exit_code);
+                            if (strstr(mline, "\"artifacts_count\":"))
+                                sscanf(strstr(mline, "\"artifacts_count\":") + 18, "%d", &art_count);
+                        }
+                        fclose(mf);
+                    }
+                }
+
+                int log_fd = open(storage_log, O_RDONLY);
+                if (log_fd >= 0)
+                {
+                    struct stat log_st;
+                    fstat(log_fd, &log_st);
+                    size_t file_size = (size_t)log_st.st_size;
+                    if (req_offset > file_size) req_offset = file_size;
+                    size_t delta = file_size - req_offset;
+                    size_t new_offset = req_offset + delta;
+                    bool want_close = request_wants_close(conn->input, conn->header_bytes);
+
+                    if (!completed && delta == 0)
+                    {
+                        close(log_fd);
+                        char hdr[256];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 202 Accepted\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: Running\r\n"
+                            "X-Log-Offset: %zu\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: %s\r\n"
+                            "\r\n",
+                            new_offset, want_close ? "close" : "keep-alive");
+                        write_dynamic_response(conn, hdr, (size_t)hlen, "", 0);
+                    }
+                    else
+                    {
+                        char hdr[512];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: %s\r\n"
+                            "X-Log-Offset: %zu\r\n"
+                            "X-Task-Exit-Code: %d\r\n"
+                            "X-Artifacts-Count: %d\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: %s\r\n"
+                            "\r\n",
+                            completed ? "Completed" : "Running",
+                            new_offset, exit_code, art_count, delta,
+                            want_close ? "close" : "keep-alive");
+#if defined(__linux__)
+                        int cork = 1;
+                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+#if defined(MSG_NOSIGNAL)
+                        send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
+#else
+                        send(conn->fd, hdr, hlen, 0);
+#endif
+                        send_file_slice_zero_copy(conn->fd, log_fd, (off_t)req_offset, delta);
+                        close(log_fd);
+#if defined(__linux__)
+                        cork = 0;
+                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+#endif
+                        conn->close_after_write = want_close;
+                        conn->output_len = 0;
+                        conn->output_offset = 0;
+                        return 1;
+                    }
+                }
+                else
+                {
+                    TaskStatus status = 0;
+                    char task_out[MAX_TASK_OUTPUT];
+                    size_t task_out_len = 0;
+                    if (task_result_get(task_id, &status, &exit_code, &art_count, task_out, &task_out_len, sizeof(task_out)) != 0)
+                    {
+                        write_response(conn, response_retrieve_404, response_retrieve_404_len);
+                    }
+                    else if (status != TASK_STATUS_COMPLETED)
+                    {
+                        char hdr[256];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 202 Accepted\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: Running\r\n"
+                            "X-Log-Offset: %zu\r\n"
+                            "Content-Length: 0\r\n"
+                            "\r\n", req_offset);
+                        write_dynamic_response(conn, hdr, (size_t)hlen, "", 0);
+                    }
+                    else
+                    {
+                        if (req_offset > task_out_len) req_offset = task_out_len;
+                        size_t delta = task_out_len - req_offset;
+                        char hdr[256];
+                        int hlen = snprintf(hdr, sizeof(hdr),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "X-Task-Status: Completed\r\n"
+                            "X-Log-Offset: %zu\r\n"
+                            "X-Task-Exit-Code: %d\r\n"
+                            "X-Artifacts-Count: %d\r\n"
+                            "Content-Length: %zu\r\n"
+                            "\r\n",
+                            task_out_len, exit_code, art_count, delta);
+                        write_dynamic_response(conn, hdr, (size_t)hlen, task_out + req_offset, delta);
+                    }
+                }
+            }
+        }
+        else if (strncmp(conn->input + 4, "/retrieve/", 10) == 0 && strstr(conn->input + 14, "/meta"))
+        {
+            const char *id_start = conn->input + 14;
+            const char *meta_marker = strstr(id_start, "/meta");
+            size_t id_len = (size_t)(meta_marker - id_start);
+            char task_id[MAX_TASK_ID] = {0};
+            if (id_len >= sizeof(task_id)) id_len = sizeof(task_id) - 1;
+            memcpy(task_id, id_start, id_len);
+            task_id[id_len] = '\0';
+
+            if (task_id[0] == '\0' || strstr(task_id, "..") || strchr(task_id, '/'))
+            {
+                write_response(conn, response_400, response_400_len);
+            }
+            else
+            {
+                char meta_path[512];
+                snprintf(meta_path, sizeof(meta_path), "/tmp/july_storage/%s/meta.json", task_id);
+                int mfd = open(meta_path, O_RDONLY);
+                if (mfd < 0)
+                {
+                    write_response(conn, response_retrieve_404, response_retrieve_404_len);
+                }
+                else
+                {
+                    struct stat st;
+                    fstat(mfd, &st);
+                    bool want_close = request_wants_close(conn->input, conn->header_bytes);
+                    char hdr[256];
+                    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: %s\r\n"
+                        "\r\n",
+                        (size_t)st.st_size, want_close ? "close" : "keep-alive");
+#if defined(MSG_NOSIGNAL)
+                    send(conn->fd, hdr, hlen, MSG_NOSIGNAL);
+#else
+                    send(conn->fd, hdr, hlen, 0);
+#endif
+                    send_file_zero_copy(conn->fd, mfd, (size_t)st.st_size);
+                    close(mfd);
+                    conn->close_after_write = want_close;
+                    conn->output_len = 0;
+                    conn->output_offset = 0;
+                    return 1;
+                }
+            }
         }
         else if (strncmp(conn->input + 4, "/retrieve/", 10) == 0 && strstr(conn->input + 14, "/artifact/"))
         {

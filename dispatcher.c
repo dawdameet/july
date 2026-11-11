@@ -39,6 +39,7 @@
 #define COLOR_MAGENTA "\033[1;35m"
 
 static bool use_colors = true;
+static bool g_async_mode = false;
 static char g_auth_token[256] = {0};
 
 static inline int append_auth_header(char *buf, size_t max_buf)
@@ -480,6 +481,206 @@ static int retrieve_task(const char *host, int port, const char *task_id,
     return retrieve_task_conn(NULL, host, port, task_id, exit_code, artifacts_count, output_body, output_len);
 }
 
+/* Stream incremental byte-offset log chunk over persistent connection.
+ * Returns: 0 = Completed, 1 = Running (may also deliver non-empty output_body delta),
+ *         -2 = Not found / endpoint unsupported (404), -1 = error.
+ */
+static int stream_task_conn(int *sock_ptr, const char *host, int port, const char *task_id,
+                            size_t *log_offset, int *exit_code, int *artifacts_count,
+                            char **output_body, size_t *output_len)
+{
+    *output_body = NULL;
+    *output_len = 0;
+
+    int sock = -1;
+    if (sock_ptr && *sock_ptr >= 0)
+    {
+        sock = *sock_ptr;
+    }
+    else
+    {
+        sock = connect_to_server(host, port);
+        if (sock < 0) return -1;
+        if (sock_ptr) *sock_ptr = sock;
+    }
+
+    char auth_hdr[300] = {0};
+    append_auth_header(auth_hdr, sizeof(auth_hdr));
+
+    char request[512];
+    int req_len = snprintf(request, sizeof(request),
+        "GET /stream/%s?offset=%zu HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "%s"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        task_id, *log_offset, host, port, auth_hdr);
+
+    if (write(sock, request, req_len) != req_len)
+    {
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        sock = connect_to_server(host, port);
+        if (sock < 0) return -1;
+        if (sock_ptr) *sock_ptr = sock;
+        if (write(sock, request, req_len) != req_len)
+        {
+            close(sock);
+            if (sock_ptr) *sock_ptr = -1;
+            return -1;
+        }
+    }
+
+    size_t capacity = RESPONSE_BUF_SIZE;
+    size_t total_read = 0;
+    char *buf = malloc(capacity);
+    if (!buf)
+    {
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -1;
+    }
+
+    char *header_end = NULL;
+    while (!header_end)
+    {
+        if (total_read >= capacity - 1)
+        {
+            capacity *= 2;
+            char *nb = realloc(buf, capacity);
+            if (!nb)
+            {
+                free(buf);
+                close(sock);
+                if (sock_ptr) *sock_ptr = -1;
+                return -1;
+            }
+            buf = nb;
+        }
+        ssize_t n = read(sock, buf + total_read, capacity - 1 - total_read);
+        if (n <= 0) break;
+        total_read += (size_t)n;
+        buf[total_read] = '\0';
+        header_end = strstr(buf, "\r\n\r\n");
+    }
+
+    if (!header_end)
+    {
+        free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -1;
+    }
+
+    int status_code = 0;
+    if (sscanf(buf, "HTTP/1.1 %d", &status_code) != 1)
+    {
+        free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -1;
+    }
+
+    bool server_wants_close = false;
+    char *conn_hdr = strcasestr(buf, "Connection:");
+    if (conn_hdr && conn_hdr < header_end && strncasecmp(conn_hdr + 11, " close", 6) == 0)
+        server_wants_close = true;
+
+    if (status_code == 404)
+    {
+        free(buf);
+        if (server_wants_close || !sock_ptr) { close(sock); if (sock_ptr) *sock_ptr = -1; }
+        return -2;
+    }
+    if (status_code == 401)
+    {
+        free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -3;
+    }
+    if (status_code == 202)
+    {
+        free(buf);
+        if (server_wants_close || !sock_ptr) { close(sock); if (sock_ptr) *sock_ptr = -1; }
+        return 1;
+    }
+    if (status_code != 200)
+    {
+        free(buf);
+        close(sock);
+        if (sock_ptr) *sock_ptr = -1;
+        return -1;
+    }
+
+    bool completed = true;
+    char *st_hdr = strcasestr(buf, "X-Task-Status:");
+    if (st_hdr && st_hdr < header_end && strncasecmp(st_hdr + 14, " Running", 8) == 0)
+        completed = false;
+
+    char *off_hdr = strcasestr(buf, "X-Log-Offset:");
+    size_t next_offset = *log_offset;
+    if (off_hdr && off_hdr < header_end)
+        next_offset = (size_t)strtoull(off_hdr + 13, NULL, 10);
+
+    *exit_code = 0;
+    char *code_hdr = strcasestr(buf, "X-Task-Exit-Code:");
+    if (code_hdr && code_hdr < header_end)
+        sscanf(code_hdr + 17, "%d", exit_code);
+
+    if (artifacts_count)
+    {
+        *artifacts_count = 0;
+        char *art_hdr = strcasestr(buf, "X-Artifacts-Count:");
+        if (art_hdr && art_hdr < header_end)
+            sscanf(art_hdr + 18, "%d", artifacts_count);
+    }
+
+    size_t content_len = 0;
+    char *cl = strcasestr(buf, "Content-Length:");
+    if (cl && cl < header_end)
+        content_len = (size_t)strtoull(cl + 15, NULL, 10);
+
+    char *body_start = header_end + 4;
+    size_t body_already_read = (size_t)(buf + total_read - body_start);
+    while (body_already_read < content_len)
+    {
+        if (total_read >= capacity - 1)
+        {
+            size_t body_off = (size_t)(body_start - buf);
+            capacity *= 2;
+            char *nb = realloc(buf, capacity);
+            if (!nb) { free(buf); close(sock); if (sock_ptr) *sock_ptr = -1; return -1; }
+            buf = nb;
+            body_start = buf + body_off;
+        }
+        size_t needed = content_len - body_already_read;
+        size_t space = capacity - 1 - total_read;
+        size_t to_read = needed < space ? needed : space;
+        ssize_t n = read(sock, buf + total_read, to_read);
+        if (n <= 0) break;
+        total_read += (size_t)n;
+        body_already_read += (size_t)n;
+    }
+
+    if (body_already_read > 0)
+    {
+        char *out = malloc(body_already_read + 1);
+        if (out)
+        {
+            memcpy(out, body_start, body_already_read);
+            out[body_already_read] = '\0';
+            *output_body = out;
+            *output_len = body_already_read;
+        }
+    }
+    *log_offset = next_offset > *log_offset ? next_offset : (*log_offset + body_already_read);
+
+    free(buf);
+    if (server_wants_close || !sock_ptr) { close(sock); if (sock_ptr) *sock_ptr = -1; }
+    return completed ? 0 : 1;
+}
+
 /* Download an artifact file with persistent socket reuse */
 static int download_artifact_conn(int *sock_ptr, const char *host, int port, const char *task_id, const char *artifact_name)
 {
@@ -824,14 +1025,23 @@ static int dispatch_envelope(const char *host, int port, const char *manifest_js
         return 1;
     }
 
+    if (g_async_mode)
+    {
+        printf("%s[✓] Workflow '%s' dispatched asynchronously!%s\n",
+               use_colors ? COLOR_GREEN : "", manifest->name, use_colors ? COLOR_RESET : "");
+        printf("JULY_ASYNC_TASK_ID=%s\n", task_id);
+        close(sock);
+        return 0;
+    }
+
     printf("%s[✓] Workflow '%s' enqueued successfully! (Task ID: %s)%s\n",
            use_colors ? COLOR_GREEN : "", manifest->name, task_id, use_colors ? COLOR_RESET : "");
     printf("%s[*] Streaming execution logs from server OS Page Cache...%s\n\n",
            use_colors ? COLOR_BLUE : "", use_colors ? COLOR_RESET : "");
 
-    // Keep the warm connection open for status polling
+    // Keep the warm connection open for live incremental log streaming
     int poll_sock = sock;
-    useconds_t poll_sleep_us = 1000; // start at 1ms sub-millisecond adaptive backoff
+    useconds_t poll_sleep_us = 2000;
 
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -840,18 +1050,47 @@ static int dispatch_envelope(const char *host, int port, const char *manifest_js
     int artifacts_count = 0;
     char *log_output = NULL;
     size_t log_len = 0;
+    size_t log_offset = 0;
+    bool stream_supported = true;
+    int last_printed_nl = 1;
 
     while (1)
     {
-        int res = retrieve_task_conn(&poll_sock, host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
+        int res;
+        if (stream_supported)
+        {
+            res = stream_task_conn(&poll_sock, host, port, task_id, &log_offset, &exit_code, &artifacts_count, &log_output, &log_len);
+            if (res == -2 && log_offset == 0)
+            {
+                // Server may not support /stream yet; fall back cleanly to /retrieve
+                stream_supported = false;
+                res = retrieve_task_conn(&poll_sock, host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
+            }
+        }
+        else
+        {
+            res = retrieve_task_conn(&poll_sock, host, port, task_id, &exit_code, &artifacts_count, &log_output, &log_len);
+        }
+
+        if (log_len > 0 && log_output)
+        {
+            fwrite(log_output, 1, log_len, stdout);
+            fflush(stdout);
+            last_printed_nl = (log_output[log_len - 1] == '\n');
+            free(log_output);
+            log_output = NULL;
+            log_len = 0;
+            poll_sleep_us = 2000; // stay responsive while active output arrives
+        }
+
         if (res == 0)
         {
             break;
         }
-        else if (res == 1 || res == -2) // 202 Still running or 404
+        else if (res == 1 || res == -2)
         {
             usleep(poll_sleep_us);
-            if (poll_sleep_us < 8000) poll_sleep_us *= 2;
+            if (poll_sleep_us < 16000) poll_sleep_us *= 2;
         }
         else
         {
@@ -873,14 +1112,8 @@ static int dispatch_envelope(const char *host, int port, const char *manifest_js
         }
     }
 
-    // Print full execution log
-    if (log_len > 0 && log_output)
-    {
-        fwrite(log_output, 1, log_len, stdout);
-        if (log_output[log_len - 1] != '\n')
-            putchar('\n');
-        free(log_output);
-    }
+    if (!last_printed_nl)
+        putchar('\n');
 
     if (poll_sock >= 0)
     {
@@ -1510,7 +1743,7 @@ static int dispatch_project(const char *config_path, const char *override_host, 
 
     chdir(saved_cwd);
 
-    if (ret == 0)
+    if (ret == 0 && !g_async_mode)
     {
         mkdir_p_parent(cache_path);
         FILE *wcf = fopen(cache_path, "wb");
@@ -1554,6 +1787,8 @@ static void print_help(const char *prog)
     printf("  -k, --token <token>     Authentication token (or set JULY_TOKEN)\n");
     printf("  -t, --timeout <sec>     Execution timeout in seconds (default: %d)\n", DEFAULT_TIMEOUT_SEC);
     printf("  -g, --get <taskId>      Retrieve output or artifact status of a task\n");
+    printf("  --async                 Dispatch and return Task ID immediately (non-blocking)\n");
+    printf("  --wait <taskId>         Stream live logs & artifacts of an async task until done\n");
     printf("  --clean                 Force clean rebuild of project workspace\n");
     printf("  --no-color              Disable ANSI color output\n");
     printf("  --help                  Show this help message\n\n");
@@ -1578,6 +1813,7 @@ int main(int argc, char **argv)
     int port = DEFAULT_PORT;
     int timeout_sec = DEFAULT_TIMEOUT_SEC;
     const char *retrieve_id = NULL;
+    const char *wait_id = NULL;
     char command_buf[MAX_TASK_CMD] = {0};
     bool clean_mode = false;
 
@@ -1628,6 +1864,14 @@ int main(int argc, char **argv)
         else if ((strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--get") == 0) && i + 1 < argc)
         {
             retrieve_id = argv[++i];
+        }
+        else if (strcmp(argv[i], "--async") == 0)
+        {
+            g_async_mode = true;
+        }
+        else if ((strcmp(argv[i], "--wait") == 0 || strcmp(argv[i], "wait") == 0) && i + 1 < argc)
+        {
+            wait_id = argv[++i];
         }
         else if (strcmp(argv[i], "workflow") == 0)
         {
@@ -1738,10 +1982,133 @@ int main(int argc, char **argv)
         }
     }
 
+    // 2.5 Wait / Live Stream Attach Mode (--wait <taskId>)
+    if (wait_id)
+    {
+        printf("%s[*] Attaching live stream for task '%s' on %s:%d...%s\n\n",
+               use_colors ? COLOR_BLUE : "", wait_id, host, port, use_colors ? COLOR_RESET : "");
+        int poll_sock = -1;
+        useconds_t poll_sleep_us = 2000;
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        int exit_code = 0, art_count = 0;
+        size_t log_offset = 0;
+        char *chunk = NULL;
+        size_t chunk_len = 0;
+        bool stream_supported = true;
+        int last_nl = 1;
+
+        while (1)
+        {
+            int res = stream_supported
+                ? stream_task_conn(&poll_sock, host, port, wait_id, &log_offset, &exit_code, &art_count, &chunk, &chunk_len)
+                : retrieve_task_conn(&poll_sock, host, port, wait_id, &exit_code, &art_count, &chunk, &chunk_len);
+
+            if (res == -2 && log_offset == 0 && stream_supported)
+            {
+                stream_supported = false;
+                res = retrieve_task_conn(&poll_sock, host, port, wait_id, &exit_code, &art_count, &chunk, &chunk_len);
+            }
+
+            if (chunk_len > 0 && chunk)
+            {
+                fwrite(chunk, 1, chunk_len, stdout);
+                fflush(stdout);
+                last_nl = (chunk[chunk_len - 1] == '\n');
+                free(chunk);
+                chunk = NULL;
+                chunk_len = 0;
+                poll_sleep_us = 2000;
+            }
+
+            if (res == 0) break;
+            if (res == 1 || res == -2)
+            {
+                usleep(poll_sleep_us);
+                if (poll_sleep_us < 16000) poll_sleep_us *= 2;
+            }
+            else
+            {
+                fprintf(stderr, "%s[!] Error attaching to '%s'%s\n", use_colors ? COLOR_RED : "", wait_id, use_colors ? COLOR_RESET : "");
+                if (poll_sock >= 0) close(poll_sock);
+                return 1;
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec - start.tv_sec) + (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+            if (elapsed >= timeout_sec)
+            {
+                fprintf(stderr, "%s[!] Timed out waiting for '%s'%s\n", use_colors ? COLOR_RED : "", wait_id, use_colors ? COLOR_RESET : "");
+                if (poll_sock >= 0) close(poll_sock);
+                return 124;
+            }
+        }
+        if (!last_nl) putchar('\n');
+        if (poll_sock >= 0) close(poll_sock);
+
+        printf("\n%s[%s] Task '%s' Finished (Exit Code: %d, Artifacts: %d)%s\n",
+               use_colors ? (exit_code == 0 ? COLOR_GREEN : COLOR_YELLOW) : "",
+               exit_code == 0 ? "✓" : "!", wait_id, exit_code, art_count, use_colors ? COLOR_RESET : "");
+
+        // Fetch meta.json to download any staged artifacts automatically
+        if (art_count > 0)
+        {
+            int msock = connect_to_server(host, port);
+            if (msock >= 0)
+            {
+                char auth_hdr[300] = {0};
+                append_auth_header(auth_hdr, sizeof(auth_hdr));
+                char mreq[512];
+                int mlen_req = snprintf(mreq, sizeof(mreq),
+                    "GET /retrieve/%s/meta HTTP/1.1\r\nHost: %s:%d\r\n%sConnection: close\r\n\r\n",
+                    wait_id, host, port, auth_hdr);
+                if (write(msock, mreq, mlen_req) == mlen_req)
+                {
+                    char mbuf[8192];
+                    size_t mtot = 0;
+                    ssize_t mr;
+                    while (mtot < sizeof(mbuf) - 1 && (mr = read(msock, mbuf + mtot, sizeof(mbuf) - 1 - mtot)) > 0)
+                        mtot += (size_t)mr;
+                    mbuf[mtot] = '\0';
+                    char *mbody = strstr(mbuf, "\r\n\r\n");
+                    if (mbody)
+                    {
+                        mbody += 4;
+                        char *arts_key = strstr(mbody, "\"artifacts\":");
+                        if (arts_key)
+                        {
+                            const char *ap = strchr(arts_key, '[');
+                            if (ap)
+                            {
+                                char arts_arr[MAX_ARTIFACTS][MAX_CMD_LEN];
+                                int acnt = 0;
+                                if (parse_json_string_array(&ap, mbuf + mtot, arts_arr, &acnt, MAX_ARTIFACTS))
+                                {
+                                    for (int k = 0; k < acnt; k++)
+                                    {
+                                        printf("%s    ➔ Downloading '%s'...%s ", use_colors ? COLOR_BLUE : "", arts_arr[k], use_colors ? COLOR_RESET : "");
+                                        fflush(stdout);
+                                        if (download_artifact(host, port, wait_id, arts_arr[k]) == 0)
+                                            printf("%s[DONE]%s\n", use_colors ? COLOR_GREEN : "", use_colors ? COLOR_RESET : "");
+                                        else
+                                            printf("%s[SKIP]%s\n", use_colors ? COLOR_YELLOW : "", use_colors ? COLOR_RESET : "");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                close(msock);
+            }
+        }
+        return exit_code;
+    }
+
     // Check if project workspace mode applies (.julyconfig exists)
     char config_path[1024];
     bool has_project = find_julyconfig(config_path, sizeof(config_path));
-    if (has_project && !workflow_mode && !retrieve_id)
+    if (has_project && !workflow_mode && !retrieve_id && !wait_id)
     {
         if (command_buf[0] == '\0' || strcmp(command_buf, "build") == 0 ||
             strcmp(command_buf, "run") == 0 || strcmp(command_buf, "clean") == 0)
@@ -1766,6 +2133,12 @@ int main(int argc, char **argv)
 
         if (dispatch_task(host, port, task_id, command_buf) != 0)
             return 1;
+
+        if (g_async_mode)
+        {
+            printf("JULY_ASYNC_TASK_ID=%s\n", task_id);
+            return 0;
+        }
 
         int exit_code = 0;
         int art_count = 0;

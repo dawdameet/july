@@ -1,0 +1,24 @@
+{
+  "project": "julyos",
+  "target": "192.168.1.41:8080",
+  "build": [
+    "make clean",
+    "make qemu-demo"
+  ],
+  "artifacts": [
+    "julyos.elf",
+    "julyos_screen.png",
+    "serial_boot.log"
+  ],
+  "ignore": [
+    ".git*",
+    "*.o",
+    "*.elf",
+    "*.png",
+    "*.ppm",
+    "*.log",
+    ".july*",
+    ".DS_Store"
+  ]
+}
+

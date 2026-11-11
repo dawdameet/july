@@ -1,0 +1,7 @@
+*.o
+*.elf
+*.png
+*.ppm
+*.log
+.july/
+
