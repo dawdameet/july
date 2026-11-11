@@ -1,4 +1,5 @@
 import { NativeTabs } from 'expo-router/native-tabs';
+import { Platform } from 'react-native';
 
 import { Palette } from '@/constants/theme';
 import { useJuly } from '@/context/july-context';
@@ -9,9 +10,11 @@ export default function AppTabs() {
 
   return (
     <NativeTabs
-      backgroundColor={Palette.card}
+      backgroundColor={Platform.OS === 'ios' ? undefined : Palette.card}
+      blurEffect="systemUltraThinMaterialDark"
       indicatorColor={Palette.elevated}
       tintColor={Palette.text}
+      iconColor={{ selected: Palette.text, default: Palette.dim }}
       labelStyle={{ selected: { color: Palette.text }, default: { color: Palette.dim } }}>
       <NativeTabs.Trigger name="index">
         <NativeTabs.Trigger.Label>Machines</NativeTabs.Trigger.Label>

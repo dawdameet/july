@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  LayoutChangeEvent,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -9,6 +10,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { TmuxTerminal } from '@/components/tmux-terminal';
@@ -41,6 +43,8 @@ export default function CommandScreen() {
   } = useJuly();
 
   const [mode, setMode] = useState<CommandMode>('tmux');
+  const [segWidth, setSegWidth] = useState(0);
+  const segX = useSharedValue(0);
   const [workspace, setWorkspace] = useState<string>('july');
   const [prompt, setPrompt] = useState('');
   const [ownedFiles, setOwnedFiles] = useState('');
@@ -220,6 +224,26 @@ export default function CommandScreen() {
   const sessionPills = [...new Set([tmuxSession, ...tmuxSessions.map((s) => s.name)])];
   const activeSessionMeta = tmuxSessions.find((s) => s.name === tmuxSession);
 
+  const slotWidth = segWidth > 8 ? (segWidth - 6) / 3 : 0;
+  useEffect(() => {
+    const idx = mode === 'tmux' ? 0 : mode === 'agent' ? 1 : 2;
+    if (slotWidth > 0) {
+      segX.value = withSpring(idx * slotWidth, {
+        damping: 20,
+        stiffness: 260,
+        mass: 0.65,
+      });
+    }
+  }, [mode, slotWidth, segX]);
+
+  const segSliderStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: segX.value }],
+  }));
+
+  const onSegLayout = (e: LayoutChangeEvent) => {
+    setSegWidth(e.nativeEvent.layout.width);
+  };
+
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
@@ -228,22 +252,22 @@ export default function CommandScreen() {
           <Text style={styles.subtitle}>target · {activeNode.name}</Text>
         </View>
 
-        <View style={styles.segment}>
-          <Pressable
-            onPress={() => setMode('tmux')}
-            style={[styles.segBtn, mode === 'tmux' && styles.segActive]}>
+        <View style={styles.segment} onLayout={onSegLayout}>
+          {slotWidth > 0 && (
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.segSlider, { width: slotWidth }, segSliderStyle]}
+            />
+          )}
+          <Pressable onPress={() => setMode('tmux')} style={styles.segBtn}>
             <Text style={[styles.segText, mode === 'tmux' && styles.segTextActive]}>Tmux</Text>
           </Pressable>
-          <Pressable
-            onPress={() => setMode('agent')}
-            style={[styles.segBtn, mode === 'agent' && styles.segActive]}>
+          <Pressable onPress={() => setMode('agent')} style={styles.segBtn}>
             <Text style={[styles.segText, mode === 'agent' && styles.segTextActive]}>
               Agent (7B)
             </Text>
           </Pressable>
-          <Pressable
-            onPress={() => setMode('command')}
-            style={[styles.segBtn, mode === 'command' && styles.segActive]}>
+          <Pressable onPress={() => setMode('command')} style={styles.segBtn}>
             <Text style={[styles.segText, mode === 'command' && styles.segTextActive]}>Shell</Text>
           </Pressable>
         </View>
@@ -501,20 +525,27 @@ const styles = StyleSheet.create({
   },
   segment: {
     flexDirection: 'row',
+    position: 'relative',
     backgroundColor: Palette.card,
-    borderRadius: 0,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: Palette.border,
     padding: 3,
-    gap: 4,
   },
-  segBtn: { flex: 1, paddingVertical: 9, borderRadius: 0, alignItems: 'center' },
-  segActive: { backgroundColor: Palette.text },
+  segSlider: {
+    position: 'absolute',
+    top: 3,
+    bottom: 3,
+    left: 3,
+    backgroundColor: Palette.text,
+    borderRadius: 7,
+  },
+  segBtn: { flex: 1, paddingVertical: 9, borderRadius: 7, alignItems: 'center', zIndex: 1 },
   segText: { color: Palette.muted, fontFamily: Fonts.semibold, fontSize: 12 },
   segTextActive: { color: Palette.inverseText, fontFamily: Fonts.bold },
   card: {
     backgroundColor: Palette.card,
-    borderRadius: 0,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: Palette.border,
     padding: 16,
@@ -523,7 +554,7 @@ const styles = StyleSheet.create({
   inlineRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   smallSolidBtn: {
     backgroundColor: Palette.text,
-    borderRadius: 0,
+    borderRadius: 8,
     paddingHorizontal: 14,
     paddingVertical: 11,
     alignItems: 'center',
@@ -566,7 +597,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Palette.border,
     backgroundColor: Palette.bg,
-    borderRadius: 0,
+    borderRadius: 6,
     paddingHorizontal: 7,
     paddingVertical: 3,
   },
@@ -587,14 +618,14 @@ const styles = StyleSheet.create({
   squareOff: {
     width: 7,
     height: 7,
-    borderRadius: 0,
+    borderRadius: 4,
     borderWidth: 1.5,
     borderColor: Palette.dim,
   },
   squareOn: {
     width: 7,
     height: 7,
-    borderRadius: 0,
+    borderRadius: 4,
     backgroundColor: Palette.text,
   },
   standbyTitle: {
@@ -637,7 +668,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Palette.border,
     backgroundColor: Palette.bg,
-    borderRadius: 0,
+    borderRadius: 7,
     paddingHorizontal: 10,
     paddingVertical: 5,
   },
@@ -657,7 +688,7 @@ const styles = StyleSheet.create({
   chip: {
     paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 0,
+    borderRadius: 8,
     backgroundColor: Palette.bg,
     borderWidth: 1,
     borderColor: Palette.border,
@@ -668,7 +699,7 @@ const styles = StyleSheet.create({
   historyChip: {
     paddingHorizontal: 9,
     paddingVertical: 4,
-    borderRadius: 0,
+    borderRadius: 6,
     backgroundColor: Palette.bg,
     borderWidth: 1,
     borderColor: Palette.border,
@@ -678,7 +709,7 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.bg,
     borderWidth: 1,
     borderColor: Palette.border,
-    borderRadius: 0,
+    borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
     color: Palette.text,
@@ -690,7 +721,7 @@ const styles = StyleSheet.create({
   dispatchBtn: {
     marginTop: 4,
     backgroundColor: Palette.text,
-    borderRadius: 0,
+    borderRadius: 10,
     paddingVertical: 13,
     alignItems: 'center',
   },
